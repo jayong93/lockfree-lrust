@@ -164,10 +164,52 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         }
     }
 
-    fn run_op(&self, desc: &Descriptor<K, V>, guard: &Guard, mode: OpRunMode) -> Option<V> {
-        let backoff = Backoff::new();
+    fn put_node_after_head<'a>(
+        &self,
+        node: &Node<K, V>,
+        guard: &'a Guard,
+    ) -> Option<ControlFlow<'a, V>> {
+        // SAFETY: Head is always valid
+        let head = unsafe { self.head.load(atomic::Ordering::Relaxed, guard).deref() };
+        // SAFETY: All data nodes are valid until GC-ed and tail is always valid.
+        let mru_node = unsafe { head.next.load(atomic::Ordering::Acquire, guard).deref() };
+        if ptr::eq(mru_node, node) {
+            return Some(ControlFlow::Return(None));
+        }
+        let node = Shared::from(node as *const _);
+        if let Err(err) = mru_node.prev.compare_exchange_weak(
+            Shared::from(head as *const _),
+            node,
+            atomic::Ordering::Release,
+            atomic::Ordering::Relaxed,
+            guard,
+        ) {
+            if !ptr::eq(err.current.as_raw(), node.as_raw()) {
+                return None;
+            }
+        }
+        // Ok even it is failed because someone already changed `head.next`.
+        head.next
+            .compare_exchange(
+                Shared::from(mru_node as *const _),
+                node,
+                atomic::Ordering::Release,
+                atomic::Ordering::Relaxed,
+                guard,
+            )
+            .ok();
 
-        let node = unsafe { desc.node.load(atomic::Ordering::Relaxed, guard).deref() };
+        Some(ControlFlow::Store(Shared::null()))
+    }
+
+    fn loop_until_succeess<'a>(
+        &self,
+        desc: &Descriptor<K, V>,
+        guard: &'a Guard,
+        mode: OpRunMode,
+        backoff: &Backoff,
+        func: impl Fn() -> Option<ControlFlow<'a, V>>,
+    ) -> Option<V> {
         loop {
             let result = desc.result.load(atomic::Ordering::Relaxed, guard);
             if result.tag() != 0 {
@@ -187,48 +229,65 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 };
             }
 
-            match &desc.op {
-                NodeOp::Hit => {
-                    self.change_head_op(desc, guard);
-                    // SAFETY: Head is always valid
-                    let head = unsafe { self.head.load(atomic::Ordering::Relaxed, guard).deref() };
-                    // SAFETY: All data nodes are valid until GC-ed and tail is always valid.
-                    let mru_node =
-                        unsafe { head.next.load(atomic::Ordering::Acquire, guard).deref() };
-                    if ptr::eq(mru_node, node) {
-                        return None;
-                    }
-                    let node = Shared::from(node as *const _);
-                    if let Err(err) = mru_node
-                        .prev
-                        .compare_exchange_weak(
-                            Shared::from(head as *const _),
-                            node,
-                            atomic::Ordering::Release,
-                            atomic::Ordering::Relaxed,
-                            guard,
-                        )
-                    {
-                        if !ptr::eq(err.current.as_raw(), node.as_raw()) {
-                            backoff.spin();
-                            continue;
-                        }
-                    }
-                    // Ok even it is failed because someone already changed `head.next`.
-                    head.next.compare_exchange(
-                        Shared::from(mru_node as *const _),
-                        node,
-                        atomic::Ordering::Release,
-                        atomic::Ordering::Relaxed,
-                        guard,
-                    ).ok();
-                    desc.store_result(Shared::null());
+            match func() {
+                None => {
+                    backoff.spin();
+                    continue;
                 }
-                NodeOp::Update { old, new } => {
-                    self.change_head_op(desc, guard);
-                    todo!("implement update op")
+                Some(ControlFlow::Store(v)) if matches!(mode, OpRunMode::NoHelp) => unsafe {
+                    let result = desc.store_result(v);
+                    let result: Shared<ManuallyDrop<V>> = std::mem::transmute(result);
+                    let mut result = result.into_owned();
+                    break Some(ManuallyDrop::take(result.as_mut()));
+                },
+                Some(ControlFlow::Store(v)) => {
+                    desc.store_result(v);
+                    break None;
                 }
-                NodeOp::Remove => {
+                Some(ControlFlow::Return(v)) => break v,
+            }
+        }
+    }
+
+    fn loop_until_succeess_without_result<'a>(
+        &self,
+        _: &'a Guard,
+        backoff: &Backoff,
+        func: impl Fn() -> Option<ControlFlow<'a, V>>,
+    ) {
+        loop {
+            match func() {
+                None => {
+                    backoff.spin();
+                    continue;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    fn run_op(&self, desc: &Descriptor<K, V>, guard: &Guard, mode: OpRunMode) -> Option<V> {
+        let backoff = Backoff::new();
+
+        let node = unsafe { desc.node.load(atomic::Ordering::Relaxed, guard).deref() };
+        match &desc.op {
+            NodeOp::Hit => {
+                self.change_head_op(desc, guard);
+                self.loop_until_succeess(desc, guard, mode, &backoff, || {
+                    self.put_node_after_head(node, guard)
+                })
+            }
+            NodeOp::Update { old, new } => {
+                self.change_head_op(desc, guard);
+                // Ignore control flow after moving a node next to head
+                self.loop_until_succeess_without_result(guard, &backoff, || {
+                    self.put_node_after_head(node, guard)
+                });
+                todo!("implement update op")
+            }
+            NodeOp::Remove => {
+                self.loop_until_succeess(desc, guard, mode, &backoff, || {
+                    let node = unsafe { desc.node.load(atomic::Ordering::Relaxed, guard).deref() };
                     let old_next = node.next.load(atomic::Ordering::Relaxed, guard);
                     let new_next = old_next.with_tag(1);
                     if node
@@ -242,8 +301,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         )
                         .is_err()
                     {
-                        backoff.spin();
-                        continue;
+                        return None;
                     };
                     let prev_node = node.find_prev_alive(guard);
                     let prev_node_next = prev_node.next.load(atomic::Ordering::Relaxed, guard);
@@ -256,11 +314,16 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         .remove(&KeyRef::new(unsafe { node.key.assume_init_ref() }));
 
                     let value = node.value.load(atomic::Ordering::Relaxed, guard);
-                    desc.store_result(value);
-                }
+                    Some(ControlFlow::Store(value))
+                })
             }
         }
     }
+}
+
+enum ControlFlow<'a, T> {
+    Store(Shared<'a, T>),
+    Return(Option<T>),
 }
 
 struct Node<K: Send + Sync, V: Send + Sync> {
@@ -379,9 +442,10 @@ impl<K: Send + Sync, V: Send + Sync> Descriptor<K, V> {
         }
     }
 
-    fn store_result(&self, value: Shared<'_, V>) {
-        self.result
-            .store(value.with_tag(1), atomic::Ordering::SeqCst);
+    fn store_result<'a>(&self, value: Shared<'a, V>) -> Shared<'a, V> {
+        let value = value.with_tag(1);
+        self.result.store(value, atomic::Ordering::SeqCst);
+        value
     }
 }
 
