@@ -64,15 +64,46 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         }
     }
 
-    fn pop_back_with_size(&self) -> (usize, Option<V>) {
-        self.size.fetch_sub(1, atomic::Ordering::Relaxed);
-        todo!()
-    }
-
-    #[inline]
     pub fn pop_back(&self) -> Option<V> {
-        let (_, value) = self.pop_back_with_size();
-        value
+        let guard = pin();
+        let mut node = self.tail.prev.load(atomic::Ordering::Relaxed, &guard);
+        let backoff = Backoff::new();
+        loop {
+            let node_ref = unsafe { node.deref() };
+            let node_next = node_ref.next.load(atomic::Ordering::Relaxed, &guard);
+            if node_next.tag() != 0 || !ptr::eq(node_next.as_raw(), self.tail.as_ref()) {
+                node = self.help_link(node, self.tail.as_ref(), &backoff, &guard);
+                continue;
+            }
+            if ptr::eq(node.as_raw(), self.head.as_ref()) {
+                return None;
+            }
+            if node_ref
+                .next
+                .compare_exchange_weak(
+                    node_next,
+                    node_next.with_tag(1),
+                    atomic::Ordering::SeqCst,
+                    atomic::Ordering::Relaxed,
+                    &guard,
+                )
+                .is_ok()
+            {
+                self.help_detach(node_ref, &backoff, &guard);
+                let prev = node_ref.prev.load(atomic::Ordering::Relaxed, &guard);
+                self.help_link(prev, self.tail.as_ref(), &backoff, &guard);
+                return Some(unsafe {
+                    std::mem::replace(
+                        &mut *(node_ref
+                            .value
+                            .load(atomic::Ordering::Acquire, &guard)
+                            .as_raw() as *mut _),
+                        MaybeUninit::<V>::uninit().assume_init(),
+                    )
+                });
+            }
+            backoff.spin();
+        }
     }
 
     pub fn put(&self, key: K, value: V) -> Option<V> {
@@ -127,10 +158,12 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 if len >= self.cap.get() {
                     let mut is_second_try = false;
                     loop {
-                        let (new_len, removed) = self.pop_back_with_size();
+                        let removed = self.pop_back();
                         // All entries in the skiplist may be pending insertions.
                         // We should help the most old insertion to make a room for our node.
-                        if new_len >= self.cap.get() && removed.is_none() {
+                        if removed.is_none()
+                            && self.size.load(atomic::Ordering::Relaxed) >= self.cap.get()
+                        {
                             if is_second_try {
                                 // Find any other node which has unfinished operation and help it.
                                 if let Some(desc) = self
@@ -247,6 +280,65 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         }
     }
 
+    // TODO: Apply ref counting to V
+    pub fn get(&self, key: &K) -> Option<&V> {
+        let Some(entry) = self.skiplist.get(&KeyRef::new(key)) else {
+            return None;
+        };
+
+        let guard = pin();
+        let node = unsafe {
+            entry
+                .value()
+                .load(atomic::Ordering::Relaxed, &guard)
+                .deref()
+        };
+        let desc = unsafe { node.desc.load(atomic::Ordering::Relaxed, &guard).deref() };
+        if let Some(NodeOpInfo {
+            op: NodeOp::Detach, ..
+        }) = desc.get_ops(&guard).last()
+        {
+            return None;
+        }
+
+        let mru = self.head.next.load(atomic::Ordering::Relaxed, &guard);
+        let value = unsafe { Some(&*node.value.load(atomic::Ordering::Acquire, &guard).as_raw()) };
+        if ptr::eq(mru.as_raw(), node) {
+            value
+        } else {
+            let mut old_desc = Shared::from(desc as *const _);
+            let new_desc = Owned::new(Descriptor::new(
+                Atomic::from(node as *const _),
+                vec![NodeOp::Detach, NodeOp::Attach],
+            ))
+            .into_shared(&guard);
+            let backoff = Backoff::new();
+            loop {
+                self.run_op(desc, &guard);
+                if let Err(err) = node.desc.compare_exchange_weak(
+                    old_desc,
+                    new_desc,
+                    atomic::Ordering::SeqCst,
+                    atomic::Ordering::Relaxed,
+                    &guard,
+                ) {
+                    old_desc = err.current;
+                    if let Some(NodeOp::Detach) = unsafe { old_desc.deref() }
+                        .get_ops(&guard)
+                        .last()
+                        .map(|op| &op.op)
+                    {
+                        return None;
+                    }
+                    backoff.spin();
+                } else {
+                    self.run_op(unsafe { new_desc.deref() }, &guard);
+                    break value;
+                }
+            }
+        }
+    }
+
     fn change_head_op(&self, desc: &Descriptor<K, V>, guard: &Guard) {
         let backoff = Backoff::new();
         let head = self.head.as_ref();
@@ -322,7 +414,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         node: &'a Node<K, V>,
         backoff: &Backoff,
         guard: &'a Guard,
-    ) {
+    ) -> Shared<'a, Node<K, V>> {
         let mut last = Shared::<Node<K, V>>::null();
         loop {
             let prev_ref = unsafe { prev.deref() };
@@ -353,7 +445,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             let node_prev = node.prev.load(atomic::Ordering::Relaxed, guard);
             // The node was removed by another thread. Pass responsibility of clean-up to that thread.
             if node_prev.tag() != 0 {
-                return;
+                return prev;
             }
             // Found a non-deleted previous node and set it as `last`.
             if !ptr::eq(prev_next.as_raw(), node) {
@@ -363,7 +455,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             }
             // Another thread already helped our job.
             if ptr::eq(node_prev.as_raw(), prev.as_raw()) {
-                return;
+                return prev;
             }
             let prev_next = prev_ref.next.load(atomic::Ordering::Relaxed, guard);
             if ptr::eq(prev_next.as_raw(), node)
@@ -379,7 +471,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     .is_ok()
             {
                 if prev_ref.prev.load(atomic::Ordering::Relaxed, guard).tag() == 0 {
-                    return;
+                    return prev;
                 }
             }
             backoff.spin();
