@@ -1,10 +1,11 @@
 use std::{
-    mem::MaybeUninit,
+    mem::{ManuallyDrop, MaybeUninit},
     num::NonZeroUsize,
-    ops::ControlFlow,
+    ops::{ControlFlow, Deref},
+    process::abort,
     ptr::{self, NonNull},
     sync::{
-        atomic::{self, AtomicUsize},
+        atomic::{self, AtomicPtr, AtomicUsize},
         OnceLock,
     },
 };
@@ -64,11 +65,12 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         }
     }
 
-    pub fn pop_back(&self) -> Option<V> {
+    pub fn pop_back(&self) -> Option<RefCounted<V>> {
         let guard = pin();
         let mut node = self.tail.prev.load(atomic::Ordering::Relaxed, &guard);
         let backoff = Backoff::new();
         loop {
+            // TODO: CAS op with Detach
             let node_ref = unsafe { node.deref() };
             let node_next = node_ref.next.load(atomic::Ordering::Relaxed, &guard);
             if node_next.tag() != 0 || !ptr::eq(node_next.as_raw(), self.tail.as_ref()) {
@@ -89,24 +91,17 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 )
                 .is_ok()
             {
+                self.size.fetch_sub(1, atomic::Ordering::Release);
                 self.help_detach(node_ref, &backoff, &guard);
                 let prev = node_ref.prev.load(atomic::Ordering::Relaxed, &guard);
                 self.help_link(prev, self.tail.as_ref(), &backoff, &guard);
-                return Some(unsafe {
-                    std::mem::replace(
-                        &mut *(node_ref
-                            .value
-                            .load(atomic::Ordering::Acquire, &guard)
-                            .as_raw() as *mut _),
-                        MaybeUninit::<V>::uninit().assume_init(),
-                    )
-                });
+                return Some(node_ref.value.clone());
             }
             backoff.spin();
         }
     }
 
-    pub fn put(&self, key: K, value: V) -> Option<V> {
+    pub fn put(&self, key: K, value: V) -> Option<RefCounted<V>> {
         let guard = pin();
         // SAFETY: Head is never deallocated.
         let head = self.head.as_ref();
@@ -658,8 +653,8 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
 }
 
 struct Node<K: Send + Sync, V: Send + Sync> {
-    key: MaybeUninit<K>,
-    value: Atomic<V>,
+    key: MaybeUninit<RefCounted<K>>,
+    value: MaybeUninit<RefCounted<V>>,
     next: Atomic<Node<K, V>>,
     prev: Atomic<Node<K, V>>,
     desc: Atomic<Descriptor<K, V>>,
@@ -676,8 +671,8 @@ impl<K: Send + Sync, V: Send + Sync> Node<K, V> {
     ) -> Shared<'a, Self> {
         let ptr = Box::leak(
             Owned::new(Self {
-                key: MaybeUninit::new(key),
-                value: Atomic::new(value),
+                key: MaybeUninit::new(RefCounted::new(key)),
+                value: RefCounted::new(MaybeUninit::new(value)),
                 next,
                 prev,
                 desc: Atomic::null(),
@@ -690,8 +685,8 @@ impl<K: Send + Sync, V: Send + Sync> Node<K, V> {
 
     fn uninit<'a>(next: Atomic<Node<K, V>>, prev: Atomic<Node<K, V>>) -> Owned<Self> {
         Owned::new(Self {
-            key: MaybeUninit::uninit(),
-            value: Atomic::null(),
+            key: RefCounted::new(MaybeUninit::uninit()),
+            value: RefCounted::new(MaybeUninit::uninit()),
             next,
             prev,
             desc: Atomic::null(),
@@ -719,6 +714,11 @@ impl<K: Send + Sync, V: Send + Sync> Node<K, V> {
             }
             backoff.spin();
         }
+    }
+
+    fn finalize(this: Self) {
+        let this = ManuallyDrop::new(this);
+        
     }
 }
 
@@ -844,4 +844,190 @@ enum NodeOp<V> {
     Detach,
     Attach,
     Update { old: Atomic<V>, new: Atomic<V> },
+}
+
+const MAX_REF_COUNT: usize = usize::MAX >> 10;
+
+#[repr(transparent)]
+pub struct RefCounted<T: Send + Sync> {
+    inner: AtomicPtr<RefCountedInner<T>>,
+}
+
+impl<T: Send + Sync> Deref for RefCounted<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &(*self.inner.load(atomic::Ordering::Acquire)).data }
+    }
+}
+
+impl<T: Send + Sync> Clone for RefCounted<T> {
+    fn clone(&self) -> Self {
+        let inner_ptr = self.inner.load(atomic::Ordering::Relaxed);
+        let inner = unsafe { &*inner_ptr };
+        let old_count = inner.ref_count.fetch_add(1, atomic::Ordering::Relaxed);
+        if old_count > MAX_REF_COUNT {
+            abort();
+        }
+        Self {
+            inner: AtomicPtr::new(inner_ptr),
+        }
+    }
+}
+
+impl<T: Send + Sync> Drop for RefCounted<T> {
+    fn drop(&mut self) {
+        let inner_ptr = self.inner.load(atomic::Ordering::Relaxed);
+        let inner = unsafe { &*inner_ptr };
+        if inner.ref_count.fetch_sub(1, atomic::Ordering::Release) == 1 {
+            atomic::fence(atomic::Ordering::Acquire);
+            let guard = pin();
+            unsafe { guard.defer_destroy(Shared::from(inner_ptr as *const RefCountedInner<T>)) };
+        }
+    }
+}
+
+impl<T: Send + Sync> RefCounted<T> {
+    #[inline]
+    fn new(data: T) -> Self {
+        let ptr = Box::into_raw(Box::new(RefCountedInner::new(data)));
+        Self {
+            inner: AtomicPtr::new(ptr),
+        }
+    }
+
+    pub fn into_inner(this: Self) -> Option<T> {
+        let this = ManuallyDrop::new(this);
+        let inner_ptr = this.inner.load(atomic::Ordering::Relaxed);
+        if unsafe { &*inner_ptr }
+            .ref_count
+            .fetch_sub(1, atomic::Ordering::Release)
+            != 1
+        {
+            return None;
+        }
+        atomic::fence(atomic::Ordering::Acquire);
+        let guard = pin();
+
+        let inner = unsafe { ptr::read(inner_ptr) };
+        unsafe {
+            guard.defer_destroy(Shared::from(
+                inner_ptr as *const ManuallyDrop<RefCountedInner<T>>,
+            ));
+        }
+        Some(inner.data)
+    }
+
+    fn as_ref(&self) -> &T {
+        self.deref()
+    }
+
+    #[inline]
+    fn compare_exchange_inner<'a>(
+        &self,
+        current: &RefCounted<T>,
+        new: RefCounted<T>,
+        success: atomic::Ordering,
+        failure: atomic::Ordering,
+        func: impl FnOnce(
+            &AtomicPtr<RefCountedInner<T>>,
+            *mut RefCountedInner<T>,
+            *mut RefCountedInner<T>,
+            atomic::Ordering,
+            atomic::Ordering,
+        ) -> Result<*mut RefCountedInner<T>, *mut RefCountedInner<T>>,
+        _: &'a Guard,
+    ) -> Result<RefCounted<T>, CompareExchangeErr<'a, T>> {
+        let current = current.inner.load(atomic::Ordering::Relaxed);
+        let new_ptr = new.inner.load(atomic::Ordering::Relaxed);
+        match func(&self.inner, current, new_ptr, success, failure) {
+            Ok(old) => Ok(Self {
+                inner: AtomicPtr::new(old),
+            }),
+            // The `old` pointer might be queued for deallocation if another thread already took it
+            // from `self` by another compare-exchange call. But we have `Guard` here we can assume
+            // the pointer is valid until the `Guard` is dropped.
+            Err(old) => Err(CompareExchangeErr {
+                current: unsafe { &*old },
+                new,
+            }),
+        }
+    }
+
+    #[inline]
+    fn compare_exchange_weak<'a>(
+        &self,
+        current: &RefCounted<T>,
+        new: RefCounted<T>,
+        success: atomic::Ordering,
+        failure: atomic::Ordering,
+        guard: &'a Guard,
+    ) -> Result<RefCounted<T>, CompareExchangeErr<'a, T>> {
+        self.compare_exchange_inner(
+            current,
+            new,
+            success,
+            failure,
+            AtomicPtr::compare_exchange_weak,
+            guard,
+        )
+    }
+
+    #[inline]
+    fn compare_exchange<'a>(
+        &self,
+        current: &RefCounted<T>,
+        new: RefCounted<T>,
+        success: atomic::Ordering,
+        failure: atomic::Ordering,
+        guard: &'a Guard,
+    ) -> Result<RefCounted<T>, CompareExchangeErr<'a, T>> {
+        self.compare_exchange_inner(
+            current,
+            new,
+            success,
+            failure,
+            AtomicPtr::compare_exchange,
+            guard,
+        )
+    }
+}
+
+struct CompareExchangeErr<'a, T: Send + Sync> {
+    current: &'a RefCountedInner<T>,
+    new: RefCounted<T>,
+}
+
+struct RefCountedInner<T: Send + Sync> {
+    ref_count: AtomicUsize,
+    data: T,
+}
+
+impl<T: Send + Sync> RefCountedInner<T> {
+    fn new(data: T) -> Self {
+        Self {
+            ref_count: AtomicUsize::new(1),
+            data,
+        }
+    }
+
+    fn try_promote(&self) -> Option<RefCounted<T>> {
+        let old_count = self.ref_count.load(atomic::Ordering::Relaxed);
+        if old_count == 0 {
+            return None;
+        }
+        if let Err(curr) = self.ref_count.compare_exchange_weak(
+            old_count,
+            old_count + 1,
+            atomic::Ordering::Acquire,
+            atomic::Ordering::Relaxed,
+        ) {
+            if curr == 0 {
+                return None;
+            }
+        }
+        Some(RefCounted {
+            inner: AtomicPtr::new(self as *const Self as *mut Self),
+        })
+    }
 }
