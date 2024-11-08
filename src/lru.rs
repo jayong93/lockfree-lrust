@@ -1,11 +1,10 @@
 use std::{
-    hint::unreachable_unchecked,
     mem::MaybeUninit,
     num::NonZeroUsize,
-    ops::{ControlFlow, Deref},
+    ops::ControlFlow,
     ptr::{self, NonNull},
     sync::{
-        atomic::{self},
+        atomic::{self, AtomicUsize},
         OnceLock,
     },
 };
@@ -15,6 +14,10 @@ use crossbeam::{
     utils::Backoff,
 };
 use crossbeam_skiplist::SkipMap;
+
+fn box_into_inner<T>(boxed: Box<T>) -> T {
+    *boxed
+}
 
 fn collector() -> &'static Collector {
     static COLLECTOR: OnceLock<Collector> = OnceLock::new();
@@ -32,9 +35,10 @@ thread_local! {
 pub struct Lru<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> {
     skiplist: SkipMap<KeyRef<K>, Atomic<Node<K, V>>>,
     // `head` and `tail` are sentry nodes which have no valid data
-    head: Atomic<Node<K, V>>,
-    tail: Atomic<Node<K, V>>,
+    head: Owned<Node<K, V>>,
+    tail: Owned<Node<K, V>>,
     cap: NonZeroUsize,
+    size: AtomicUsize,
 }
 
 impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Drop for Lru<K, V> {
@@ -53,21 +57,28 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         tail.prev = head_ptr.into();
         Self {
             skiplist: SkipMap::new(),
-            head: head.into(),
-            tail: tail.into(),
+            head,
+            tail,
             cap: capacity,
+            size: AtomicUsize::new(0),
         }
     }
 
-    pub fn pop_back(&self) -> Option<V> {
+    fn pop_back_with_size(&self) -> (usize, Option<V>) {
+        self.size.fetch_sub(1, atomic::Ordering::Relaxed);
         todo!()
+    }
+
+    #[inline]
+    pub fn pop_back(&self) -> Option<V> {
+        let (_, value) = self.pop_back_with_size();
+        value
     }
 
     pub fn put(&self, key: K, value: V) -> Option<V> {
         let guard = pin();
-        let head = self.head.load(atomic::Ordering::Relaxed, &guard);
         // SAFETY: Head is never deallocated.
-        let head = unsafe { head.deref() };
+        let head = self.head.as_ref();
         let new_node = Node::new(
             key,
             value,
@@ -88,25 +99,84 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         let backoff = Backoff::new();
 
         'outer: loop {
-            let entry = self
-                .skiplist
-                .get_or_insert(key_ref.clone(), Atomic::from(new_node as *const _));
+            let entry = self.skiplist.compare_insert(
+                key_ref.clone(),
+                Atomic::from(new_node as *const _),
+                |node_ptr| {
+                    let node = unsafe { node_ptr.load(atomic::Ordering::Relaxed, &guard).deref() };
+
+                    // Remove an existing skiplist entry only when the node's last op is `Detach`
+                    if let Some(NodeOpInfo {
+                        op: NodeOp::Detach, ..
+                    }) = unsafe { node.desc.load(atomic::Ordering::Relaxed, &guard).as_ref() }
+                        .and_then(|desc| desc.get_ops(&guard).last())
+                    {
+                        return true;
+                    }
+                    false
+                },
+            );
 
             let node = entry.value().load(atomic::Ordering::Relaxed, &guard);
             let node = unsafe { node.deref() };
-            let desc = if ptr::eq(node, new_node) {
-                // My node has been inserted.
+            let old_value = if ptr::eq(node, new_node) {
+                // Our node has been inserted.
+                let len = self.size.fetch_add(1, atomic::Ordering::Acquire);
 
                 // If the capacity is reached, remove LRU node.
-                let mut len = self.skiplist.len();
-                while len > self.cap.get() {
-                    self.pop_back();
-                    let new_len = self.skiplist.len();
-                    // Might fail to remove any node because all skiplist entries might be pending
-                    // inserted nodes. We should help one of them.
-                    todo!()
+                if len >= self.cap.get() {
+                    let mut is_second_try = false;
+                    loop {
+                        let (new_len, removed) = self.pop_back_with_size();
+                        // All entries in the skiplist may be pending insertions.
+                        // We should help the most old insertion to make a room for our node.
+                        if new_len >= self.cap.get() && removed.is_none() {
+                            if is_second_try {
+                                // Find any other node which has unfinished operation and help it.
+                                if let Some(desc) = self
+                                    .skiplist
+                                    .iter()
+                                    .filter_map(|entry| unsafe {
+                                        let desc = entry
+                                            .value()
+                                            .load(atomic::Ordering::Acquire, &guard)
+                                            .deref()
+                                            .desc
+                                            .load(atomic::Ordering::Relaxed, &guard)
+                                            .deref();
+                                        desc.get_ops(&guard)
+                                            .last()
+                                            .filter(|last_op| {
+                                                last_op
+                                                    .result
+                                                    .load(atomic::Ordering::Relaxed, &guard)
+                                                    .tag()
+                                                    == 0
+                                            })
+                                            .map(|_| desc)
+                                    })
+                                    .next()
+                                {
+                                    self.run_op(desc, &guard);
+                                }
+                                // There is no other node with unfinished operation.
+                                // Retry refreshingly.
+                                else {
+                                    is_second_try = false;
+                                }
+                            } else if let Some(head_desc) = unsafe {
+                                head.desc.load(atomic::Ordering::Acquire, &guard).as_ref()
+                            } {
+                                self.run_op(head_desc, &guard);
+                                is_second_try = true;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
                 }
-                desc
+                self.run_op(desc, &guard);
+                None
             } else {
                 // Another node alreay exists
 
@@ -125,7 +195,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 // Need `acquire` ordering to read value of OP properly
                 let mut old_desc =
                     unsafe { node.desc.load(atomic::Ordering::Acquire, &guard).deref() };
-                loop {
+                let desc = loop {
                     self.run_op(old_desc, &guard);
                     if matches!(
                         old_desc.get_ops(&guard).last().map(|op| &op.op),
@@ -135,16 +205,16 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         backoff.spin();
                         continue 'outer;
                     }
-                    match unsafe {
-                        desc.get_ops_mut(&guard)
-                            .last_mut()
-                            .map(|op| &mut op.op)
-                            .unwrap_unchecked()
-                    } {
+                    match desc
+                        .get_ops_mut(&guard)
+                        .last_mut()
+                        .map(|op| &mut op.op)
+                        .unwrap()
+                    {
                         NodeOp::Update { old, .. } => {
                             *old = node.value.load(atomic::Ordering::Relaxed, &guard).into();
                         }
-                        _ => unsafe { unreachable_unchecked() },
+                        _ => unreachable!(),
                     }
 
                     if let Err(err) = node.desc.compare_exchange_weak(
@@ -159,17 +229,27 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         break unsafe { desc.into_shared(&guard).deref() };
                     }
                     backoff.spin();
+                };
+                self.run_op(desc, &guard);
+                let result = desc
+                    .get_ops(&guard)
+                    .last()
+                    .unwrap()
+                    .result
+                    .load(atomic::Ordering::Acquire, &guard);
+                if result.is_null() {
+                    None
+                } else {
+                    Some(unsafe { box_into_inner(result.into_owned().into_box()) })
                 }
             };
-
-            self.run_op(desc, &guard);
-            todo!()
+            break old_value;
         }
     }
 
     fn change_head_op(&self, desc: &Descriptor<K, V>, guard: &Guard) {
         let backoff = Backoff::new();
-        let head = unsafe { self.head.load(atomic::Ordering::Relaxed, guard).deref() };
+        let head = self.head.as_ref();
         let mut old_head_desc = head.desc.load(atomic::Ordering::Acquire, &guard);
         loop {
             if ptr::eq(old_head_desc.as_raw(), desc) {
@@ -204,7 +284,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         guard: &'a Guard,
     ) -> ControlFlow<Shared<'a, V>> {
         // SAFETY: Head is always valid
-        let head = unsafe { self.head.load(atomic::Ordering::Relaxed, guard).deref() };
+        let head = self.head.as_ref();
         // SAFETY: All data nodes are valid until GC-ed and tail is always valid.
         let mru_node = unsafe { head.next.load(atomic::Ordering::Acquire, guard).deref() };
         if ptr::eq(mru_node, node) {
@@ -239,11 +319,71 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
     fn help_link<'a>(
         &self,
         mut prev: Shared<'a, Node<K, V>>,
-        node: &Node<K, V>,
+        node: &'a Node<K, V>,
         backoff: &Backoff,
         guard: &'a Guard,
     ) {
-        todo!()
+        let mut last = Shared::<Node<K, V>>::null();
+        loop {
+            let prev_ref = unsafe { prev.deref() };
+            let prev_next = prev_ref.next.load(atomic::Ordering::Relaxed, guard);
+            if prev_next.tag() != 0 {
+                // A thread who was tried to remove `prev` don't update `last`'s next pointer yet.
+                // We will update it instead.
+                if !last.is_null() {
+                    prev_ref.mark_prev(backoff, guard);
+                    unsafe { last.deref() }
+                        .next
+                        .compare_exchange(
+                            Shared::from(prev_ref as *const _),
+                            prev_next.with_tag(0),
+                            atomic::Ordering::SeqCst,
+                            atomic::Ordering::Relaxed,
+                            guard,
+                        )
+                        .ok();
+                    prev = last;
+                    last = Shared::null();
+                } else {
+                    // Find a previous node which is not deleted.
+                    prev = prev_ref.prev.load(atomic::Ordering::Relaxed, guard);
+                }
+                continue;
+            }
+            let node_prev = node.prev.load(atomic::Ordering::Relaxed, guard);
+            // The node was removed by another thread. Pass responsibility of clean-up to that thread.
+            if node_prev.tag() != 0 {
+                return;
+            }
+            // Found a non-deleted previous node and set it as `last`.
+            if !ptr::eq(prev_next.as_raw(), node) {
+                last = prev;
+                prev = prev_next;
+                continue;
+            }
+            // Another thread already helped our job.
+            if ptr::eq(node_prev.as_raw(), prev.as_raw()) {
+                return;
+            }
+            let prev_next = prev_ref.next.load(atomic::Ordering::Relaxed, guard);
+            if ptr::eq(prev_next.as_raw(), node)
+                && node
+                    .prev
+                    .compare_exchange_weak(
+                        node_prev,
+                        prev,
+                        atomic::Ordering::SeqCst,
+                        atomic::Ordering::Relaxed,
+                        guard,
+                    )
+                    .is_ok()
+            {
+                if prev_ref.prev.load(atomic::Ordering::Relaxed, guard).tag() == 0 {
+                    return;
+                }
+            }
+            backoff.spin();
+        }
     }
 
     fn help_detach<'a>(&self, node: &Node<K, V>, backoff: &Backoff, guard: &'a Guard) {
@@ -417,14 +557,9 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 // So we don't need to store any result.
             }
             NodeOp::Detach => {
-                // TODO: Add a new flag for postprocessing of result
-                // and remove a node from skiplist if postprocess is not done yet.
-                if self.loop_until_succeess(op, guard, &backoff, || {
+                self.loop_until_succeess(op, guard, &backoff, || {
                     self.detach_node(node, &backoff, guard)
-                }) {
-                    self.skiplist
-                        .remove(&KeyRef::new(unsafe { node.key.assume_init_ref() }));
-                }
+                });
             }
         });
     }
