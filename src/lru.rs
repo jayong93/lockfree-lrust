@@ -62,15 +62,50 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         }
     }
 
+    pub fn size(&self) -> usize {
+        self.size.load(atomic::Ordering::Relaxed)
+    }
+
     pub fn remove(&self, key: &K) -> Option<RefCounted<V>> {
         let Some(entry) = self.skiplist.get(key) else {
             return None;
         };
-        let node = entry.value();
         let guard = pin();
+        let node = entry.value().load(atomic::Ordering::Relaxed, &guard);
+        let node_ref = unsafe { node.deref() };
+        let mut old_desc = unsafe {
+            node_ref
+                .desc
+                .load(atomic::Ordering::Acquire, &guard)
+                .deref()
+        };
+        if let NodeOp::Detach = old_desc.get_ops(&guard).last().map(|op| &op.op).unwrap() {
+            return None;
+        }
+        let new_desc = Owned::new(Descriptor::new(node.into(), vec![NodeOp::Detach]));
         let backoff = Backoff::new();
         loop {
-
+            self.run_op(old_desc, &guard);
+            if let Err(err) = node_ref.desc.compare_exchange_weak(
+                Shared::from(ptr::from_ref(old_desc)),
+                Shared::from(ptr::from_ref(new_desc.as_ref())),
+                atomic::Ordering::SeqCst,
+                atomic::Ordering::Acquire,
+                &guard,
+            ) {
+                old_desc = unsafe { err.current.deref() };
+            } else {
+                self.size.fetch_sub(1, atomic::Ordering::Release);
+                self.run_op(unsafe { new_desc.into_shared(&guard).deref() }, &guard);
+                let value = unsafe { node_ref.value.assume_init_ref() }.clone();
+                unsafe {
+                    guard.defer_unchecked(move || {
+                        Node::finalize(node.as_raw());
+                    });
+                }
+                break Some(value);
+            }
+            backoff.spin();
         }
     }
 
@@ -107,11 +142,12 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 .is_ok()
             {
                 self.size.fetch_sub(1, atomic::Ordering::Release);
-                let new_desc = unsafe { new_desc.into_shared(&guard).deref() };
-                self.run_op(new_desc, &guard);
+                self.run_op(unsafe { new_desc.into_shared(&guard).deref() }, &guard);
                 let value = unsafe { node_ref.value.assume_init_ref() }.clone();
                 unsafe {
-                    guard.defer_destroy(node);
+                    guard.defer_unchecked(move || {
+                        Node::finalize(node.as_raw());
+                    });
                 }
                 break Some(value);
             }
@@ -146,15 +182,18 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             let entry =
                 self.skiplist
                     .compare_insert(key, Atomic::from(new_node as *const _), |node_ptr| {
-                        let node =
+                        let node_ref =
                             unsafe { node_ptr.load(atomic::Ordering::Relaxed, &guard).deref() };
+                        let desc = unsafe {
+                            node_ref
+                                .desc
+                                .load(atomic::Ordering::Acquire, &guard)
+                                .deref()
+                        };
 
                         // Remove an existing skiplist entry only when the node's last op is `Detach`
-                        if let Some(NodeOpInfo {
-                            op: NodeOp::Detach, ..
-                        }) =
-                            unsafe { node.desc.load(atomic::Ordering::Relaxed, &guard).as_ref() }
-                                .and_then(|desc| desc.get_ops(&guard).last())
+                        if let NodeOp::Detach =
+                            desc.get_ops(&guard).last().map(|op| &op.op).unwrap()
                         {
                             return true;
                         }
@@ -162,8 +201,8 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     });
 
             let node = entry.value().load(atomic::Ordering::Relaxed, &guard);
-            let node = unsafe { node.deref() };
-            let old_value = if ptr::eq(node, new_node) {
+            let node_ref = unsafe { node.deref() };
+            let old_value = if ptr::eq(node_ref, new_node) {
                 // Our node has been inserted.
                 let len = self.size.fetch_add(1, atomic::Ordering::Acquire);
 
@@ -175,7 +214,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         // All entries in the skiplist may be pending insertions.
                         // We should help the most old insertion to make a room for our node.
                         if removed.is_none()
-                            && self.size.load(atomic::Ordering::Relaxed) >= self.cap.get()
+                            && self.size.load(atomic::Ordering::Acquire) >= self.cap.get()
                         {
                             if is_second_try {
                                 // Find any other node which has unfinished operation and help it.
@@ -185,10 +224,10 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                                     .filter_map(|entry| unsafe {
                                         let desc = entry
                                             .value()
-                                            .load(atomic::Ordering::Acquire, &guard)
+                                            .load(atomic::Ordering::Relaxed, &guard)
                                             .deref()
                                             .desc
-                                            .load(atomic::Ordering::Relaxed, &guard)
+                                            .load(atomic::Ordering::Acquire, &guard)
                                             .deref();
                                         desc.get_ops(&guard)
                                             .last()
@@ -226,11 +265,11 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             } else {
                 // Another node alreay exists
 
-                let mut old_value = unsafe { node.value.assume_init_ref() };
+                let mut old_value = unsafe { node_ref.value.assume_init_ref() };
                 let new_value = unsafe { new_node.value.assume_init_ref().clone() };
                 // SAFETY: `op` was not seen by other thread yet, so it is safe to be replaced.
                 let mut desc = Owned::new(Descriptor::new(
-                    Atomic::from(node as *const _),
+                    Atomic::from(node_ref as *const _),
                     vec![
                         NodeOp::Detach,
                         NodeOp::Attach,
@@ -241,8 +280,12 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     ],
                 ));
                 // Need `acquire` ordering to read value of OP properly
-                let mut old_desc =
-                    unsafe { node.desc.load(atomic::Ordering::Acquire, &guard).deref() };
+                let mut old_desc = unsafe {
+                    node_ref
+                        .desc
+                        .load(atomic::Ordering::Acquire, &guard)
+                        .deref()
+                };
                 let desc = loop {
                     self.run_op(old_desc, &guard);
 
@@ -272,10 +315,10 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         _ => unreachable!(),
                     }
 
-                    if let Err(err) = node.desc.compare_exchange_weak(
+                    if let Err(err) = node_ref.desc.compare_exchange_weak(
                         (old_desc as *const Descriptor<K, V>).into(),
                         Shared::from(desc.as_ref() as *const Descriptor<K, V>),
-                        atomic::Ordering::SeqCst,
+                        atomic::Ordering::Release,
                         atomic::Ordering::Acquire,
                         &guard,
                     ) {
@@ -340,8 +383,8 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 if let Err(err) = node.desc.compare_exchange_weak(
                     old_desc,
                     new_desc,
-                    atomic::Ordering::SeqCst,
-                    atomic::Ordering::Relaxed,
+                    atomic::Ordering::Release,
+                    atomic::Ordering::Acquire,
                     &guard,
                 ) {
                     old_desc = err.current;
@@ -362,22 +405,32 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         }
     }
 
-    fn change_head_op(&self, desc: &Descriptor<K, V>, guard: &Guard) {
+    // Set head's OP same as mine
+    fn change_head_op<'a>(
+        &self,
+        desc: &Descriptor<K, V>,
+        op_info: &NodeOpInfo<V>,
+        guard: &'a Guard,
+    ) -> Option<Shared<'a, Node<K, V>>> {
         let backoff = Backoff::new();
         let head = self.head.as_ref();
         let mut old_head_desc = head.desc.load(atomic::Ordering::Acquire, &guard);
         loop {
             if ptr::eq(old_head_desc.as_raw(), desc) {
-                return;
-            }
-            if let Some(op_info) = desc.get_ops(guard).iter().rev().next() {
-                if op_info.result.load(atomic::Ordering::Relaxed, guard).tag() != 0 {
-                    // Another thread already finished the operation.
-                    return;
+                let next = head.next.load(atomic::Ordering::SeqCst, guard);
+                // If the above load runs before storing result from another thread, the `next`
+                // pointer is still right next pointer.
+                if op_info.result.load(atomic::Ordering::Relaxed, guard).tag() == 0 {
+                    return Some(next);
                 }
+                return None;
             }
 
-            self.run_op(unsafe { old_head_desc.deref() }, &guard);
+            if let Some(head_desc) = unsafe { old_head_desc.as_ref() } {
+                self.run_op(head_desc, guard);
+            }
+
+            let next = head.next.load(atomic::Ordering::Relaxed, guard);
             if let Err(err) = head.desc.compare_exchange_weak(
                 old_head_desc,
                 Shared::from(desc as *const Descriptor<K, V>),
@@ -387,7 +440,8 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             ) {
                 old_head_desc = err.current;
             } else {
-                return;
+                op_info.store_result(next, guard);
+                return Some(next);
             }
             backoff.spin();
         }
@@ -452,8 +506,8 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         .compare_exchange(
                             Shared::from(prev_ref as *const _),
                             prev_next.with_tag(0),
-                            atomic::Ordering::SeqCst,
-                            atomic::Ordering::Relaxed,
+                            atomic::Ordering::Release,
+                            atomic::Ordering::Acquire,
                             guard,
                         )
                         .ok();
@@ -487,7 +541,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     .compare_exchange_weak(
                         node_prev,
                         prev,
-                        atomic::Ordering::SeqCst,
+                        atomic::Ordering::Release,
                         atomic::Ordering::Relaxed,
                         guard,
                     )
@@ -535,7 +589,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         .compare_exchange(
                             prev.with_tag(0),
                             prev_next.with_tag(0),
-                            atomic::Ordering::SeqCst,
+                            atomic::Ordering::Release,
                             atomic::Ordering::Relaxed,
                             guard,
                         )
@@ -560,7 +614,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 .compare_exchange_weak(
                     Shared::from(node as *const _),
                     next,
-                    atomic::Ordering::SeqCst,
+                    atomic::Ordering::Release,
                     atomic::Ordering::Relaxed,
                     guard,
                 )
@@ -585,7 +639,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 if let Err(err) = node.next.compare_exchange_weak(
                     next,
                     new_next,
-                    atomic::Ordering::SeqCst,
+                    atomic::Ordering::Release,
                     atomic::Ordering::Relaxed,
                     guard,
                 ) {
@@ -595,6 +649,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     }
                     // Another thread removed the next node and update `next` pointer of this node
                     else {
+                        atomic::fence(atomic::Ordering::Acquire);
                         self.help_link(
                             Shared::from(node as *const _),
                             unsafe { err.current.deref() },
@@ -650,17 +705,18 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         let node = unsafe { desc.node.load(atomic::Ordering::Relaxed, guard).deref() };
         desc.run_ops(guard, |op| match &op.op {
             NodeOp::Attach => {
-                // Set head's OP same as mine
-                self.change_head_op(desc, guard);
                 self.loop_until_succeess(op, guard, &backoff, || {
                     self.put_node_after_head(node, guard)
                 });
+            }
+            NodeOp::ChangeHeadDesc => {
+                self.change_head_op(desc, op, guard);
             }
             NodeOp::Update { old, new } => {
                 if let Ok(old) = unsafe { node.value.assume_init_ref() }.compare_exchange(
                     old,
                     new.clone(),
-                    atomic::Ordering::SeqCst,
+                    atomic::Ordering::AcqRel,
                     atomic::Ordering::Relaxed,
                     guard,
                 ) {
@@ -721,7 +777,7 @@ impl<K: Send + Sync, V: Send + Sync> Node<K, V> {
 
     fn mark_prev(&self, backoff: &Backoff, guard: &Guard) {
         loop {
-            let prev = self.prev.load(atomic::Ordering::Relaxed, guard);
+            let prev = self.prev.load(atomic::Ordering::Acquire, guard);
             if prev.tag() != 0 {
                 return;
             }
@@ -730,7 +786,7 @@ impl<K: Send + Sync, V: Send + Sync> Node<K, V> {
                 .compare_exchange_weak(
                     prev,
                     prev.with_tag(1),
-                    atomic::Ordering::SeqCst,
+                    atomic::Ordering::Release,
                     atomic::Ordering::Relaxed,
                     guard,
                 )
@@ -743,11 +799,11 @@ impl<K: Send + Sync, V: Send + Sync> Node<K, V> {
     }
 
     /// Should not used on head/tail node
-    unsafe fn finalize(this: Self) {
-        let mut this = ManuallyDrop::new(this);
+    unsafe fn finalize(this: *const Self) {
+        let this = this.cast_mut();
         unsafe {
-            this.key.assume_init_drop();
-            this.value.assume_init_drop();
+            (&mut *this).key.assume_init_drop();
+            (&mut *this).value.assume_init_drop();
         }
     }
 }
@@ -812,22 +868,22 @@ impl<K: Send + Sync, V: Send + Sync> Descriptor<K, V> {
 }
 
 struct NodeOpInfo<V: Send + Sync> {
-    result: Atomic<V>,
+    result: Atomic<()>,
     op: NodeOp<V>,
 }
 
 impl<V: Send + Sync> NodeOpInfo<V> {
-    fn store_result<'a>(&self, value: Shared<'a, V>, guard: &'a Guard) -> bool {
+    fn store_result<'a, T: Sized>(&self, value: Shared<'a, T>, guard: &'a Guard) -> bool {
         let old_value = self.result.load(atomic::Ordering::Relaxed, guard);
         if old_value.tag() != 0 {
             return false;
         }
-        let value = value.with_tag(1);
+        let value = Shared::from(value.as_raw().cast::<()>()).with_tag(1);
         self.result
             .compare_exchange(
                 old_value,
                 value,
-                atomic::Ordering::Release,
+                atomic::Ordering::SeqCst,
                 atomic::Ordering::Acquire,
                 guard,
             )
@@ -837,6 +893,7 @@ impl<V: Send + Sync> NodeOpInfo<V> {
 
 enum NodeOp<V: Send + Sync> {
     Detach,
+    ChangeHeadDesc,
     Attach,
     Update {
         old: RefCounted<V>,

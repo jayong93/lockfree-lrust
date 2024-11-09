@@ -3,6 +3,13 @@ name = "lockfree_car"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "lockfree_car"
+
+[[bin]]
+name = "cache"
+path = "src/main.rs"
+
 [dependencies]
 crossbeam = {version="0.8.4", default-features=false, features=["crossbeam-queue", "crossbeam-epoch", "alloc"]}
 crossbeam-skiplist = "*"
