@@ -31,7 +31,7 @@ use crossbeam_skiplist::SkipMap;
 // }
 
 pub struct Lru<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> {
-    skiplist: SkipMap<AtomicRefCounted<K>, Atomic<Node<K, V>>>,
+    skiplist: SkipMap<RefCounted<K>, Atomic<Node<K, V>>>,
     // `head` and `tail` are sentry nodes which have no valid data
     head: Owned<Node<K, V>>,
     tail: Owned<Node<K, V>>,
@@ -66,7 +66,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         self.size.load(Ordering::Relaxed)
     }
 
-    pub fn remove(&self, key: &K) -> Option<AtomicRefCounted<V>> {
+    pub fn remove(&self, key: &K) -> Option<RefCounted<V>> {
         let Some(entry) = self.skiplist.get(key) else {
             return None;
         };
@@ -74,22 +74,16 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         let guard = pin();
         let node = entry.value().load(Ordering::Relaxed, &guard);
         let node_ref = unsafe { node.deref() };
-        let mut old_desc = node_ref.desc.clone();
-        let desc = AtomicRefCounted::new(Descriptor::new(node.into(), vec![NodeOp::Detach]));
-        let mut new_desc = desc.try_clone().unwrap();
+        let mut old_desc = node_ref.desc.load(Ordering::Acquire, &guard).unwrap();
+        let desc = RefCounted::new(Descriptor::new(node.into(), vec![NodeOp::Detach]));
+        let mut new_desc = desc.clone();
         let backoff = Backoff::new();
         loop {
-            let old_desc_ref = unsafe { old_desc.deref(Ordering::Acquire) };
-            if let NodeOp::Detach = old_desc_ref
-                .get_ops(&guard)
-                .last()
-                .map(|op| &op.op)
-                .unwrap()
-            {
+            if let NodeOp::Detach = old_desc.get_ops(&guard).last().map(|op| &op.op).unwrap() {
                 return None;
             }
 
-            self.run_op(old_desc_ref, &guard);
+            self.run_op(old_desc.deref(), &guard);
             if let Err(err) = node_ref.desc.compare_exchange_weak(
                 &old_desc,
                 new_desc,
@@ -97,15 +91,13 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 Ordering::SeqCst,
                 &guard,
             ) {
-                old_desc = err
-                    .current
-                    .try_promote()
-                    .unwrap_or_else(|| node_ref.clone_desc());
+                old_desc = err.current.unwrap();
                 new_desc = err.new;
             } else {
-                self.size.fetch_sub(1, Ordering::Release);
-                self.run_op(unsafe { desc.deref(Ordering::Relaxed) }, &guard);
-                let value = node_ref.value.try_clone().unwrap();
+                entry.remove();
+                self.size.fetch_sub(1, Ordering::Relaxed);
+                self.run_op(desc.deref(), &guard);
+                let value = node_ref.value.load(Ordering::Relaxed, &guard).unwrap();
                 unsafe {
                     guard.defer_destroy(node);
                 }
@@ -115,7 +107,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         }
     }
 
-    pub fn pop_back(&self) -> Option<AtomicRefCounted<V>> {
+    pub fn pop_back(&self) -> Option<RefCounted<V>> {
         let guard = pin();
         let backoff = Backoff::new();
         loop {
@@ -124,32 +116,37 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 return None;
             }
             let node_ref = unsafe { node.deref() };
-            let old_desc = unsafe { node_ref.desc.load(Ordering::Acquire, &guard).deref() };
-            self.run_op(old_desc, &guard);
+            let old_desc = node_ref.desc.load(Ordering::Acquire, &guard).unwrap();
+            self.run_op(old_desc.deref(), &guard);
             if let NodeOp::Detach = old_desc.get_ops(&guard).last().unwrap().op {
                 continue;
             }
 
-            let new_desc = Owned::new(Descriptor::new(node.into(), vec![NodeOp::Detach]));
+            let desc = RefCounted::new(Descriptor::new(node.into(), vec![NodeOp::Detach]));
+            let new_desc = desc.clone();
             if node_ref
                 .desc
                 .compare_exchange_weak(
-                    Shared::from(ptr::from_ref(old_desc)),
-                    Shared::from(ptr::from_ref(new_desc.as_ref())),
+                    &old_desc,
+                    new_desc,
                     Ordering::SeqCst,
                     Ordering::Relaxed,
                     &guard,
                 )
                 .is_ok()
             {
+                self.skiplist.remove(
+                    node_ref
+                        .key
+                        .load(Ordering::Relaxed, &guard)
+                        .unwrap()
+                        .deref(),
+                );
                 self.size.fetch_sub(1, Ordering::Release);
-                self.run_op(unsafe { new_desc.into_shared(&guard).deref() }, &guard);
-                let value = unsafe { node_ref.value.assume_init_ref() }.clone();
+                self.run_op(desc.deref(), &guard);
+                let value = node_ref.value.load(Ordering::Relaxed, &guard).unwrap();
                 unsafe {
-                    // guard.defer_destroy(ptr::from_ref(old_desc).into());
-                    guard.defer_unchecked(move || {
-                        Node::finalize(node.as_raw());
-                    });
+                    guard.defer_destroy(node);
                 }
                 break Some(value);
             }
@@ -157,7 +154,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         }
     }
 
-    pub fn put(&self, key: K, value: V) -> Option<AtomicRefCounted<V>> {
+    pub fn put(&self, key: K, value: V) -> Option<RefCounted<V>> {
         let guard = pin();
         let head = self.head.as_ref();
         let new_node = Node::new(
@@ -169,16 +166,16 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             &guard,
         );
         let new_node = unsafe { new_node.deref() };
-        let desc = unsafe { new_node.desc.load(Ordering::Relaxed, &guard).deref() };
+        let desc = new_node.desc.load(Ordering::Relaxed, &guard).unwrap();
         let backoff = Backoff::new();
 
         'outer: loop {
-            let key = unsafe { new_node.key.assume_init_ref().clone() };
+            let key = new_node.key.load(Ordering::Relaxed, &guard).unwrap();
             let entry =
                 self.skiplist
                     .compare_insert(key, Atomic::from(new_node as *const _), |node_ptr| {
                         let node_ref = unsafe { node_ptr.load(Ordering::Relaxed, &guard).deref() };
-                        let desc = unsafe { node_ref.desc.load(Ordering::Relaxed, &guard).deref() };
+                        let desc = node_ref.desc.load(Ordering::Relaxed, &guard).unwrap();
 
                         // Remove an existing skiplist entry only when the node's last op is `Detach`
                         if let NodeOp::Detach =
@@ -198,90 +195,44 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 // If the capacity is reached, remove LRU node.
                 if len >= self.cap.get() {
                     atomic::fence(Ordering::Acquire);
-                    let mut is_second_try = false;
-                    loop {
-                        let removed = self.pop_back();
-                        // All entries in the skiplist may be pending insertions.
-                        // We should help the most old insertion to make a room for our node.
-                        if removed.is_none() && self.size.load(Ordering::Acquire) >= self.cap.get()
-                        {
-                            if is_second_try {
-                                // Find any other node which has unfinished operation and help it.
-                                if let Some(desc) = self
-                                    .skiplist
-                                    .iter()
-                                    .filter_map(|entry| unsafe {
-                                        let desc = entry
-                                            .value()
-                                            .load(Ordering::Relaxed, &guard)
-                                            .deref()
-                                            .desc
-                                            .load(Ordering::Acquire, &guard)
-                                            .deref();
-                                        desc.get_ops(&guard)
-                                            .last()
-                                            .filter(|last_op| {
-                                                last_op.result.load(Ordering::Relaxed, &guard).tag()
-                                                    == 0
-                                            })
-                                            .map(|_| desc)
-                                    })
-                                    .next()
-                                {
-                                    self.run_op(desc, &guard);
-                                }
-                                // There is no other node with unfinished operation.
-                                // Retry refreshingly.
-                                else {
-                                    is_second_try = false;
-                                }
-                            } else if let Some(head_desc) =
-                                unsafe { head.desc.load(Ordering::Acquire, &guard).as_ref() }
-                            {
-                                self.run_op(head_desc, &guard);
-                                is_second_try = true;
-                            } else {
-                                unreachable!()
-                            }
-                        } else {
-                            break;
-                        }
-                    }
+                    self.pop_back();
                 }
-                self.run_op(desc, &guard);
+                self.run_op(&*desc, &guard);
                 None
             } else {
                 // Another node alreay exists
 
-                let mut old_value = unsafe { node_ref.value.assume_init_ref() };
-                let new_value = unsafe { new_node.value.assume_init_ref().clone() };
-                // SAFETY: `op` was not seen by other thread yet, so it is safe to be replaced.
-                let mut desc = Owned::new(Descriptor::new(
-                    Atomic::from(node_ref as *const _),
-                    vec![
-                        NodeOp::Detach,
-                        NodeOp::ChangeHeadDesc,
-                        NodeOp::Attach,
-                        NodeOp::Update {
-                            old: old_value.clone(),
-                            new: new_value,
-                        },
-                    ],
-                ));
+                let mut old_value = node_ref.value.load(Ordering::Relaxed, &guard).unwrap();
+                let new_value = new_node.value.load(Ordering::Relaxed, &guard).unwrap();
+                let mut desc = {
+                    let new_value = new_value.clone();
+                    RefCounted::new(Descriptor::new(
+                        Atomic::from(node_ref as *const _),
+                        vec![
+                            NodeOp::Detach,
+                            NodeOp::ChangeHeadDesc,
+                            NodeOp::Attach,
+                            NodeOp::Update {
+                                old: old_value,
+                                new: new_value,
+                            },
+                        ],
+                    ))
+                };
                 // Need `acquire` ordering to read value of OP properly
-                let mut old_desc = unsafe { node_ref.desc.load(Ordering::Acquire, &guard).deref() };
+                let mut old_desc = node_ref.desc.load(Ordering::Acquire, &guard).unwrap();
                 let desc = loop {
-                    self.run_op(old_desc, &guard);
+                    self.run_op(&*old_desc, &guard);
 
                     let last_old_ops = old_desc.get_ops(&guard).last().map(|op| &op.op).unwrap();
-                    // The node was removed, try to allocate a new node
                     match last_old_ops {
+                        // The node was removed, try to allocate a new node
                         NodeOp::Detach => {
                             backoff.spin();
                             continue 'outer;
                         }
                         NodeOp::Update { new, .. } => {
-                            old_value = new;
+                            old_value = new.clone();
                         }
                         _ => {}
                     }
@@ -300,22 +251,20 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     }
 
                     if let Err(err) = node_ref.desc.compare_exchange_weak(
-                        ptr::from_ref(old_desc).into(),
-                        Shared::from(ptr::from_ref(desc.as_ref())),
+                        &old_desc,
+                        desc.clone(),
                         Ordering::SeqCst,
-                        Ordering::Acquire,
+                        Ordering::SeqCst,
                         &guard,
                     ) {
-                        old_desc = unsafe { err.current.deref() }
+                        old_desc = err.current.unwrap();
+                        desc = err.new;
                     } else {
-                        break unsafe {
-                            // guard.defer_destroy(ptr::from_ref(old_desc).into());
-                            desc.into_shared(&guard).deref()
-                        };
+                        break desc;
                     }
                     backoff.spin();
                 };
-                self.run_op(desc, &guard);
+                self.run_op(&*desc, &guard);
                 let result = desc
                     .get_ops(&guard)
                     .last()
@@ -325,7 +274,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 if result.is_null() {
                     None
                 } else {
-                    Some(unsafe { AtomicRefCounted::from_raw(result.as_raw() as *mut V) })
+                    Some(unsafe { RefCounted::from_raw(result.as_raw().cast()) })
                 }
             };
             break old_value;
@@ -402,7 +351,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         let mut old_head_desc = head.clone_desc();
         loop {
             if op_info.result.load(Ordering::Relaxed, guard).tag() != 0 {
-                return None
+                return None;
             }
 
             if ptr::eq(old_head_desc.as_ptr(), desc.as_ptr()) {
@@ -754,6 +703,17 @@ struct Node<K: Send + Sync, V: Send + Sync> {
     desc: AtomicRefCounted<Descriptor<K, V>>,
 }
 
+impl<K: Send + Sync, V: Send + Sync> Drop for Node<K, V> {
+    fn drop(&mut self) {
+        let key = std::mem::replace(&mut self.key, AtomicRefCounted::null());
+        let value = std::mem::replace(&mut self.value, AtomicRefCounted::null());
+        let desc = std::mem::replace(&mut self.desc, AtomicRefCounted::null());
+        key.finalize();
+        value.finalize();
+        desc.finalize();
+    }
+}
+
 impl<K: Send + Sync, V: Send + Sync> Node<K, V> {
     #[inline]
     fn new<'a>(
@@ -766,15 +726,18 @@ impl<K: Send + Sync, V: Send + Sync> Node<K, V> {
     ) -> Shared<'a, Self> {
         let ptr = Box::leak(
             Owned::new(Self {
-                key: AtomicRefCounted::new(key),
-                value: AtomicRefCounted::new(value),
+                key: AtomicRefCounted::new(RefCounted::new(key)),
+                value: AtomicRefCounted::new(RefCounted::new(value)),
                 next,
                 prev,
                 desc: AtomicRefCounted::null(),
             })
             .into_box(),
         );
-        ptr.desc = AtomicRefCounted::new(Descriptor::new(Atomic::from(ptr::from_ref(ptr)), ops));
+        ptr.desc = AtomicRefCounted::new(RefCounted::new(Descriptor::new(
+            Atomic::from(ptr::from_ref(ptr)),
+            ops,
+        )));
         Shared::from(ptr::from_ref(ptr))
     }
 
@@ -918,8 +881,8 @@ enum NodeOp<V: Send + Sync> {
     ChangeHeadDesc,
     Attach,
     Update {
-        old: AtomicRefCounted<V>,
-        new: AtomicRefCounted<V>,
+        old: RefCounted<V>,
+        new: RefCounted<V>,
     },
 }
 
@@ -930,7 +893,39 @@ pub struct RefCounted<T: Send + Sync> {
     inner: NonNull<RefCountedInner<T>>,
 }
 
+impl<T: Send + Sync> Clone for RefCounted<T> {
+    fn clone(&self) -> Self {
+        let inner = unsafe { self.inner.as_ref() };
+        inner.increment();
+        Self {
+            inner: unsafe { NonNull::new_unchecked(ptr::from_ref(inner).cast_mut()) },
+        }
+    }
+}
+
+impl<T: Send + Sync> Drop for RefCounted<T> {
+    fn drop(&mut self) {
+        unsafe {
+            self.inner.as_ref().decrement();
+        }
+    }
+}
+
+unsafe impl<T: Send + Sync> Send for RefCounted<T> {}
+unsafe impl<T: Send + Sync> Sync for RefCounted<T> {}
+
 impl<T: Send + Sync> RefCounted<T> {
+    #[inline]
+    pub fn new(data: T) -> Self {
+        Self {
+            inner: unsafe {
+                NonNull::new_unchecked(Box::into_raw(
+                    Owned::new(RefCountedInner::new(data)).into_box(),
+                ))
+            },
+        }
+    }
+
     pub fn into_inner(this: Self) -> Option<T> {
         let this = ManuallyDrop::new(this);
         let inner_ptr = this.inner.as_ptr();
@@ -956,20 +951,34 @@ impl<T: Send + Sync> RefCounted<T> {
     }
 
     #[inline]
-    fn into_raw(self) -> *mut T {
+    pub fn into_raw(self) -> *const T {
         self.inner.as_ptr().cast()
     }
 
     #[inline]
-    unsafe fn from_raw(ptr: *mut T) -> Self {
+    pub unsafe fn from_raw(this: *const T) -> Self {
         Self {
-            inner: NonNull::new_unchecked(ptr.cast()),
+            inner: NonNull::new_unchecked(this.cast_mut().cast()),
         }
     }
 
     #[inline]
-    fn as_ptr(&self) -> *const T {
+    pub fn as_ptr(&self) -> *const T {
         self.inner.as_ptr().cast_const().cast()
+    }
+
+    #[inline]
+    fn into_inner_raw(self) -> *const RefCountedInner<T> {
+        let ptr = self.inner.as_ptr();
+        std::mem::forget(self);
+        ptr
+    }
+
+    #[inline]
+    unsafe fn from_inner_raw(this: *const RefCountedInner<T>) -> Self {
+        Self {
+            inner: NonNull::new_unchecked(this.cast_mut()),
+        }
     }
 }
 
@@ -1008,113 +1017,88 @@ impl<T: Send + Sync + Ord> Ord for RefCounted<T> {
 }
 
 #[repr(transparent)]
-pub struct AtomicRefCounted<T: Send + Sync> {
-    inner: AtomicPtr<RefCountedInner<T>>,
+struct AtomicRefCounted<T: Send + Sync> {
+    inner: Atomic<RefCountedInner<T>>,
 }
 
-impl<T: Send + Sync> Drop for AtomicRefCounted<T> {
-    fn drop(&mut self) {
-        let inner_ptr = self.inner.load(Ordering::Relaxed);
-        if inner_ptr.is_null() {
-            return;
-        }
-        let inner = unsafe { &*inner_ptr };
-        if inner.ref_count.fetch_sub(1, Ordering::Release) == 1 {
-            atomic::fence(Ordering::Acquire);
-            let guard = pin();
-            unsafe { guard.defer_destroy(Shared::from(inner_ptr.cast_const())) };
-        }
-    }
-}
+unsafe impl<T: Send + Sync> Send for AtomicRefCounted<T> {}
+unsafe impl<T: Send + Sync> Sync for AtomicRefCounted<T> {}
 
 impl<T: Send + Sync> AtomicRefCounted<T> {
     #[inline]
-    fn new(data: T) -> Self {
-        let ptr = Box::into_raw(Box::new(RefCountedInner::new(data)));
+    fn new(data: RefCounted<T>) -> Self {
         Self {
-            inner: AtomicPtr::new(ptr),
+            inner: Atomic::from(data.into_inner_raw()),
         }
     }
 
     #[inline]
     fn null() -> Self {
         Self {
-            inner: AtomicPtr::new(ptr::null_mut()),
+            inner: Atomic::null(),
         }
     }
 
     /// This keeps trying to clone `RefCounted` until success. Because
-    fn load(&self, guard: &Guard) -> Option<RefCounted<T>> {
-        loop {
-            if let Some(new) = self.try_load(guard) {
-                break new;
-            }
+    #[inline]
+    fn load(&self, order: Ordering, guard: &Guard) -> Option<RefCounted<T>> {
+        let inner = self.inner.load(order, guard);
+        if let Some(inner) = unsafe { inner.as_ref() } {
+            inner.increment();
+            unsafe { Some(RefCounted::from_inner_raw(ptr::from_ref(inner))) }
+        } else {
+            None
         }
-    }
-
-    fn try_load(&self, _: &Guard) -> Option<Option<RefCounted<T>>> {
-        let inner_ptr = self.inner.load(Ordering::Relaxed);
-        if inner_ptr.is_null() {
-            return Some(None);
-        }
-        let inner = unsafe { &*inner_ptr };
-        let mut old_count = inner.ref_count.load(Ordering::Relaxed);
-        loop {
-            if old_count >= MAX_REF_COUNT {
-                abort();
-            }
-            if old_count == 0 {
-                return None;
-            }
-            if let Err(current) = inner.ref_count.compare_exchange_weak(
-                old_count,
-                old_count + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                old_count = current;
-            } else {
-                break Some(Some(RefCounted {
-                    inner: unsafe { NonNull::new_unchecked(inner_ptr) },
-                }));
-            };
-        }
-    }
-
-    fn swap(&self, value: RefCounted<T>, order: Ordering, _: &Guard) -> RefCounted<T> {
-        let old = self.inner.swap(value.inner.as_ptr(), order);
     }
 
     #[inline]
-    fn compare_exchange_common<'a>(
-        &self,
-        current: &AtomicRefCounted<T>,
-        new: AtomicRefCounted<T>,
+    fn compare_exchange_common<'a, F>(
+        &'a self,
+        current: &RefCounted<T>,
+        new: RefCounted<T>,
         success: Ordering,
         failure: Ordering,
-        func: impl FnOnce(
-            &AtomicPtr<RefCountedInner<T>>,
-            *mut RefCountedInner<T>,
-            *mut RefCountedInner<T>,
+        func: F,
+        guard: &'a Guard,
+    ) -> Result<RefCounted<T>, CompareExchangeErr<T>>
+    where
+        T: 'a,
+        F: FnOnce(
+            &'a Atomic<RefCountedInner<T>>,
+            Shared<'a, RefCountedInner<T>>,
+            Shared<'a, RefCountedInner<T>>,
             Ordering,
             Ordering,
-        ) -> Result<*mut RefCountedInner<T>, *mut RefCountedInner<T>>,
-        _: &'a Guard,
-    ) -> Result<AtomicRefCounted<T>, CompareExchangeErr<'a, T>> {
-        let current = current.inner.load(Ordering::Relaxed);
-        let new_ptr = new.inner.load(Ordering::Relaxed);
-        match func(&self.inner, current, new_ptr, success, failure) {
-            Ok(old) => Ok(Self {
-                inner: AtomicPtr::new(old),
-            }),
+            &'a Guard,
+        ) -> Result<
+            Shared<'a, RefCountedInner<T>>,
+            crossbeam::epoch::CompareExchangeError<
+                'a,
+                RefCountedInner<T>,
+                Shared<'a, RefCountedInner<T>>,
+            >,
+        >,
+    {
+        let current = current.inner.as_ptr().cast_const();
+        let new_ptr = new.inner.as_ptr().cast_const();
+        match func(
+            &self.inner,
+            current.into(),
+            new_ptr.into(),
+            success,
+            failure,
+            guard,
+        ) {
+            Ok(old) => Ok(unsafe { RefCounted::from_inner_raw(old.as_raw()) }),
             // The `old` pointer might be queued for deallocation if another thread already took it
             // from `self` by another compare-exchange call. But we have `Guard` here we can assume
             // the pointer is valid until the `Guard` is dropped.
             Err(old) => Err(CompareExchangeErr {
-                current: if old.is_null() {
-                    None
-                } else {
-                    unsafe { Some(&*old) }
+                current: unsafe {
+                    old.current.as_ref().map(|inner| {
+                        inner.increment();
+                        RefCounted::from_inner_raw(inner)
+                    })
                 },
                 new,
             }),
@@ -1124,18 +1108,18 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     #[inline]
     fn compare_exchange_weak<'a>(
         &self,
-        current: &AtomicRefCounted<T>,
-        new: AtomicRefCounted<T>,
+        current: &RefCounted<T>,
+        new: RefCounted<T>,
         success: Ordering,
         failure: Ordering,
         guard: &'a Guard,
-    ) -> Result<AtomicRefCounted<T>, CompareExchangeErr<'a, T>> {
+    ) -> Result<RefCounted<T>, CompareExchangeErr<T>> {
         self.compare_exchange_common(
             current,
             new,
             success,
             failure,
-            AtomicPtr::compare_exchange_weak,
+            Atomic::compare_exchange_weak::<Shared<_>>,
             guard,
         )
     }
@@ -1143,26 +1127,32 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     #[inline]
     fn compare_exchange<'a>(
         &self,
-        current: &AtomicRefCounted<T>,
-        new: AtomicRefCounted<T>,
+        current: &RefCounted<T>,
+        new: RefCounted<T>,
         success: Ordering,
         failure: Ordering,
         guard: &'a Guard,
-    ) -> Result<AtomicRefCounted<T>, CompareExchangeErr<'a, T>> {
+    ) -> Result<RefCounted<T>, CompareExchangeErr<T>> {
         self.compare_exchange_common(
             current,
             new,
             success,
             failure,
-            AtomicPtr::compare_exchange,
+            Atomic::compare_exchange::<Shared<_>>,
             guard,
         )
     }
+
+    fn finalize(self) {
+        if let Some(inner) = unsafe { self.inner.try_into_owned() } {
+            Box::leak(inner.into_box()).decrement();
+        }
+    }
 }
 
-struct CompareExchangeErr<'a, T: Send + Sync> {
-    current: Option<&'a RefCountedInner<T>>,
-    new: AtomicRefCounted<T>,
+struct CompareExchangeErr<T: Send + Sync> {
+    current: Option<RefCounted<T>>,
+    new: RefCounted<T>,
 }
 
 #[repr(C)]
@@ -1179,12 +1169,12 @@ impl<T: Send + Sync> RefCountedInner<T> {
         }
     }
 
-    fn try_increment(&self) -> bool {
+    fn increment(&self) {
         let mut old_count = self.ref_count.load(Ordering::Relaxed);
 
         loop {
             if old_count >= MAX_REF_COUNT {
-                break false;
+                abort()
             }
 
             if let Err(current) = self.ref_count.compare_exchange_weak(
@@ -1195,7 +1185,7 @@ impl<T: Send + Sync> RefCountedInner<T> {
             ) {
                 old_count = current;
             } else {
-                break true;
+                break;
             };
         }
     }
@@ -1212,14 +1202,13 @@ impl<T: Send + Sync> RefCountedInner<T> {
         let this_ref = unsafe { &*this };
         let old_count = this_ref.ref_count.load(Ordering::Relaxed);
 
-        if old_count > 0 {
+        if old_count > 0 || old_count == usize::MAX {
             return;
         }
-        if old_count == usize::MAX
-            || this_ref
-                .ref_count
-                .compare_exchange_weak(0, usize::MAX, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
+        if this_ref
+            .ref_count
+            .compare_exchange_weak(0, usize::MAX, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
         {
             drop(Owned::from_raw(this.cast_mut()))
         }
