@@ -83,14 +83,14 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
 
             self.run_op(old_desc.deref(), &guard);
             if let Err(err) = node_ref.desc.compare_exchange_weak(
-                &old_desc,
-                new_desc,
+                Some(&old_desc),
+                Some(new_desc),
                 Ordering::SeqCst,
                 Ordering::SeqCst,
                 &guard,
             ) {
                 old_desc = err.current.unwrap();
-                new_desc = err.new;
+                new_desc = err.new.unwrap();
             } else {
                 entry.remove();
                 self.size.fetch_sub(1, Ordering::Relaxed);
@@ -125,8 +125,8 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             if node_ref
                 .desc
                 .compare_exchange_weak(
-                    &old_desc,
-                    new_desc,
+                    Some(&old_desc),
+                    Some(new_desc),
                     Ordering::SeqCst,
                     Ordering::Relaxed,
                     &guard,
@@ -250,17 +250,21 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     }
 
                     if let Err(err) = node_ref.desc.compare_exchange_weak(
-                        &old_desc,
+                        Some(&old_desc),
                         // SAFETY: SyncUnsafeCell has the same memory layout with inner type.
-                        unsafe { std::mem::transmute(desc.clone()) },
+                        Some(unsafe {
+                            RefCounted::from_inner_raw(desc.clone().into_inner_raw().cast())
+                        }),
                         Ordering::SeqCst,
                         Ordering::SeqCst,
                         &guard,
                     ) {
                         old_desc = err.current.unwrap();
-                        desc = unsafe { std::mem::transmute(err.new) };
+                        desc = unsafe {
+                            RefCounted::from_inner_raw(err.new.unwrap().into_inner_raw().cast())
+                        };
                     } else {
-                        break unsafe { std::mem::transmute(desc) };
+                        break unsafe { RefCounted::from_inner_raw(desc.into_inner_raw().cast()) };
                     }
                     backoff.spin();
                 };
@@ -314,8 +318,8 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             let backoff = Backoff::new();
             loop {
                 if let Err(err) = node.desc.compare_exchange_weak(
-                    &old_desc,
-                    new_desc.clone(),
+                    Some(&old_desc),
+                    Some(new_desc.clone()),
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                     &guard,
@@ -501,7 +505,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
     ) -> Shared<'a, Node<K, V>> {
         let mut last = Shared::<Node<K, V>>::null();
         loop {
-            let prev_ref = unsafe { prev.deref() };
+            let prev_ref = unsafe { prev.as_ref().unwrap() };
             let prev_next = prev_ref.next.load(Ordering::Relaxed, guard);
             if prev_next.tag() != 0 {
                 // A thread who was tried to remove `prev` don't update `last`'s next pointer yet.
@@ -566,6 +570,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         node.mark_prev(backoff, guard);
         let mut last = Shared::<Node<K, V>>::null();
         let mut prev = node.prev.load(Ordering::Relaxed, guard);
+        assert!(!prev.is_null());
         let mut next = node.next.load(Ordering::Relaxed, guard);
         loop {
             // Not need to null check for `prev`/`next` because if they are set as head/tail
@@ -606,6 +611,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 } else {
                     // Find a previous node which is not deleted.
                     prev = prev_ref.prev.load(Ordering::Relaxed, guard);
+                    assert!(!prev.is_null());
                 }
                 continue;
             }
@@ -613,6 +619,9 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             if !ptr::eq(prev_next.as_raw(), node) {
                 last = prev;
                 prev = prev_next;
+                if prev.is_null() {
+                    abort()
+                }
                 continue;
             }
 
@@ -699,7 +708,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     return op.store_result(Shared::from(RefCounted::into_raw(v)), guard);
                 }
                 _ => {
-                    return op.store_result(Shared::<()>::null(), guard);
+                    return op.store_result(Shared::null(), guard);
                 }
             }
         }
@@ -721,14 +730,14 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             //     }
             // }
             NodeOp::Update { old, new } => {
-                if let Ok(old) = node.value.compare_exchange(
-                    old,
-                    new.clone(),
+                if let Ok(CompareExchangeOk { old }) = node.value.compare_exchange(
+                    Some(old),
+                    Some(new.clone()),
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     guard,
                 ) {
-                    op.store_result(Shared::from(RefCounted::into_raw(old)), guard);
+                    op.store_result(Shared::from(RefCounted::into_raw(old.unwrap())), guard);
                 }
                 // The failure of CAS above means that another thread has succeeded in changing.
                 // So we don't need to store any result.
@@ -885,17 +894,18 @@ impl<K: Send + Sync, V: Send + Sync> Descriptor<K, V> {
 
 #[derive(Debug, Clone)]
 struct NodeOpInfo<V: Send + Sync> {
-    result: Atomic<()>,
+    result: Atomic<V>,
     op: NodeOp<V>,
 }
 
 impl<V: Send + Sync> NodeOpInfo<V> {
-    fn store_result<'a, T: Sized>(&self, value: Shared<'a, T>, guard: &'a Guard) -> bool {
+    #[inline]
+    fn store_result<'a>(&self, value: Shared<'a, V>, guard: &'a Guard) -> bool {
         let old_value = self.result.load(Ordering::Relaxed, guard);
         if old_value.tag() != 0 {
             return false;
         }
-        let value = Shared::from(value.as_raw().cast::<()>()).with_tag(1);
+        let value = value.with_tag(1);
         self.result
             .compare_exchange(
                 old_value,
@@ -1088,13 +1098,13 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     #[inline]
     fn compare_exchange_common<'a, F>(
         &'a self,
-        current: &RefCounted<T>,
-        new: RefCounted<T>,
+        current: Option<&RefCounted<T>>,
+        new: Option<RefCounted<T>>,
         success: Ordering,
         failure: Ordering,
         func: F,
         guard: &'a Guard,
-    ) -> Result<RefCounted<T>, CompareExchangeErr<T>>
+    ) -> Result<CompareExchangeOk<T>, CompareExchangeErr<T>>
     where
         T: 'a,
         F: FnOnce(
@@ -1113,17 +1123,24 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
             >,
         >,
     {
-        let current = current.inner.as_ptr().cast_const();
-        let new_ptr = new.inner.as_ptr().cast_const();
-        match func(
-            &self.inner,
-            current.into(),
-            new_ptr.into(),
-            success,
-            failure,
-            guard,
-        ) {
-            Ok(old) => Ok(unsafe { RefCounted::from_inner_raw(old.as_raw()) }),
+        let current = if let Some(current) = current {
+            Shared::from(current.inner.as_ptr().cast_const())
+        } else {
+            Shared::null()
+        };
+        let new_ptr = if let Some(new) = &new {
+            Shared::from(new.inner.as_ptr().cast_const())
+        } else {
+            Shared::null()
+        };
+        match func(&self.inner, current, new_ptr, success, failure, guard) {
+            Ok(_) => Ok(unsafe {
+                CompareExchangeOk {
+                    old: current
+                        .as_ref()
+                        .map(|current| RefCounted::from_inner_raw(current)),
+                }
+            }),
             // The `old` pointer might be queued for deallocation if another thread already took it
             // from `self` by another compare-exchange call. But we have `Guard` here we can assume
             // the pointer is valid until the `Guard` is dropped.
@@ -1142,12 +1159,12 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     #[inline]
     fn compare_exchange_weak<'a>(
         &self,
-        current: &RefCounted<T>,
-        new: RefCounted<T>,
+        current: Option<&RefCounted<T>>,
+        new: Option<RefCounted<T>>,
         success: Ordering,
         failure: Ordering,
         guard: &'a Guard,
-    ) -> Result<RefCounted<T>, CompareExchangeErr<T>> {
+    ) -> Result<CompareExchangeOk<T>, CompareExchangeErr<T>> {
         self.compare_exchange_common(
             current,
             new,
@@ -1161,12 +1178,12 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     #[inline]
     fn compare_exchange<'a>(
         &self,
-        current: &RefCounted<T>,
-        new: RefCounted<T>,
+        current: Option<&RefCounted<T>>,
+        new: Option<RefCounted<T>>,
         success: Ordering,
         failure: Ordering,
         guard: &'a Guard,
-    ) -> Result<RefCounted<T>, CompareExchangeErr<T>> {
+    ) -> Result<CompareExchangeOk<T>, CompareExchangeErr<T>> {
         self.compare_exchange_common(
             current,
             new,
@@ -1184,9 +1201,12 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     }
 }
 
+struct CompareExchangeOk<T: Send + Sync> {
+    old: Option<RefCounted<T>>,
+}
 struct CompareExchangeErr<T: Send + Sync> {
     current: Option<RefCounted<T>>,
-    new: RefCounted<T>,
+    new: Option<RefCounted<T>>,
 }
 
 #[repr(C)]
@@ -1236,7 +1256,7 @@ impl<T: Send + Sync> RefCountedInner<T> {
         let this_ref = unsafe { &*this };
         let old_count = this_ref.ref_count.load(Ordering::Relaxed);
 
-        if old_count > 0 || old_count == usize::MAX {
+        if old_count > 0 {
             return;
         }
         if this_ref
