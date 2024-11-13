@@ -6,10 +6,10 @@ fn main() {
     println!("do");
     let cache: Lru<usize, usize> = Lru::new(NonZeroUsize::new(100).unwrap());
     std::thread::scope(|s| {
-        for _ in 0..2 {
+        for _ in 0..8 {
             s.spawn(|| {
                 for i in 0..1000000 {
-                    cache.put(i % 98 + 1, i);
+                    cache.put(1, i);
                 }
             });
         }
