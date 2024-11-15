@@ -4,16 +4,16 @@ use lockfree_car::{self, lru::Lru};
 
 fn main() {
     println!("do");
-    let cache: Lru<usize, usize> = Lru::new(NonZeroUsize::new(100).unwrap());
+    let cache: Lru<bool, usize> = Lru::new(NonZeroUsize::new(100).unwrap());
     std::thread::scope(|s| {
-        for _ in 0..8 {
+        for _ in 0..16 {
             s.spawn(|| {
                 for i in 0..1000000 {
-                    cache.put(1, i);
+                    cache.put(false, i);
                 }
             });
         }
     });
-    assert_eq!(cache.size(), 98);
+    assert_eq!(cache.size(), 1);
     println!("done");
 }
