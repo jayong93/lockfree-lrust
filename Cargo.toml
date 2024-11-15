@@ -14,3 +14,7 @@ path = "src/main.rs"
 crossbeam = {version="0.8.4", default-features=false, features=["crossbeam-queue", "crossbeam-epoch", "alloc"]}
 crossbeam-skiplist = "*"
 thread_local = "1.1.8"
+
+[profile.release]
+debug = "full"
+split-debuginfo = "packed"
