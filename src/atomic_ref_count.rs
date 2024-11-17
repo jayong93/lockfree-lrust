@@ -17,6 +17,12 @@ pub struct RefCounted<T: Send + Sync> {
     inner: NonNull<RefCountedInner<T>>,
 }
 
+impl<T: Send + Sync> From<T> for RefCounted<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
 impl<T: Send + Sync> Clone for RefCounted<T> {
     fn clone(&self) -> Self {
         let inner = unsafe { self.inner.as_ref() };
@@ -137,8 +143,23 @@ impl<T: Send + Sync + Ord> Ord for RefCounted<T> {
 }
 
 #[repr(transparent)]
+#[derive(Debug)]
 pub struct AtomicRefCounted<T: Send + Sync> {
     inner: Atomic<RefCountedInner<T>>,
+}
+
+impl<T: Send + Sync> Drop for AtomicRefCounted<T> {
+    fn drop(&mut self) {
+        let fake_guard = unsafe { crossbeam::epoch::unprotected() };
+        if let Some(inner) = unsafe {
+            self.inner
+                .swap(Shared::null().with_tag(1), Ordering::Relaxed, fake_guard)
+                .as_ref()
+        } {
+            atomic::fence(Ordering::Acquire);
+            inner.decrement();
+        }
+    }
 }
 
 unsafe impl<T: Send + Sync> Send for AtomicRefCounted<T> {}
@@ -180,7 +201,11 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     }
 
     #[inline]
-    pub fn try_clone_inner(&self, order: Ordering, guard: &Guard) -> Result<Option<RefCounted<T>>, ()> {
+    pub fn try_clone_inner(
+        &self,
+        order: Ordering,
+        guard: &Guard,
+    ) -> Result<Option<RefCounted<T>>, ()> {
         let inner = self.inner.load(order, guard);
         if let Some(inner) = unsafe { inner.as_ref() } {
             if inner.try_increment() {
@@ -302,10 +327,42 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
         )
     }
 
-    pub fn finalize(self, guard: &Guard) {
-        if let Some(inner) = unsafe { self.inner.load(Ordering::Acquire, guard).as_ref() } {
-            inner.decrement();
+    #[inline]
+    pub fn make_constant(
+        &self,
+        expected: Option<&T>,
+        success: Ordering,
+        failure: Ordering,
+        guard: &Guard,
+    ) -> bool {
+        let value = if let Some(value) = expected {
+            Shared::from(ptr::from_ref(value).cast::<RefCountedInner<T>>())
+        } else {
+            Shared::null()
+        };
+
+        let cur_value = self.inner.load(Ordering::Relaxed, guard);
+        if !ptr::eq(cur_value.as_raw(), value.as_raw()) {
+            return false;
         }
+        if cur_value.tag() != 0 {
+            return true;
+        }
+
+        if let Err(err) =
+            self.inner
+                .compare_exchange(value, value.with_tag(1), success, failure, guard)
+        {
+            if err.current == value.with_tag(1) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[inline]
+    pub fn is_constant(&self, guard: &Guard) -> bool {
+        self.inner.load(Ordering::Relaxed, guard).tag() != 0
     }
 }
 
