@@ -1,6 +1,6 @@
 use std::{
     num::NonZeroUsize,
-    ops::ControlFlow,
+    ops::{ControlFlow, Deref},
     process::abort,
     ptr::{self},
     sync::atomic::{self, AtomicUsize, Ordering},
@@ -111,7 +111,12 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             let old_desc = node_ref.desc.load(Ordering::Relaxed, &guard);
             let old_desc_ref = unsafe { old_desc.deref() };
             match &old_desc_ref {
-                Descriptor::Remove(_) | Descriptor::Detach(_) => {
+                Descriptor::Remove(_) => {
+                    node = node_ref.prev.load(Ordering::Acquire, &guard);
+                    continue;
+                }
+                Descriptor::Detach(op) => {
+                    op.run_op(self, node_ref, &backoff, &guard);
                     node = node_ref.prev.load(Ordering::Acquire, &guard);
                     continue;
                 }
@@ -127,6 +132,16 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         Ordering::Relaxed,
                         &guard,
                     ) {
+                        if let Some(entry) =
+                            self.skiplist.get(node_ref.key.as_ref().unwrap().deref())
+                        {
+                            if ptr::eq(
+                                entry.value().load(Ordering::Relaxed, &guard).as_raw(),
+                                node.as_raw(),
+                            ) {
+                                entry.remove();
+                            }
+                        }
                         self.size.fetch_sub(1, Ordering::Relaxed);
                         unsafe { new.deref() }.run_op(self, node_ref, &backoff, &guard);
                         unsafe {
@@ -159,7 +174,8 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             let entry = self
                 .skiplist
                 .compare_insert(key, Atomic::from(new_node), |node_ptr| {
-                    let node_ref = unsafe { node_ptr.load(Ordering::Relaxed, &guard).deref() };
+                    let node = node_ptr.load(Ordering::Relaxed, &guard);
+                    let node_ref = unsafe { node.deref() };
                     let desc = node_ref.desc.load(Ordering::Relaxed, &guard);
 
                     // Remove an existing skiplist entry only when the node's op is `Remove`
@@ -789,6 +805,11 @@ mod op {
                         ptr::eq(old_node.as_raw(), node)
                     });
             let inserted = new_entry.value().load(Ordering::Relaxed, guard);
+            if !ptr::eq(inserted.as_raw(), new_node.as_raw()) {
+                unsafe {
+                    guard.defer_destroy(new_node);
+                }
+            }
 
             let old_node = self.new_node.load(Ordering::Relaxed, guard);
             if old_node.tag() == 0 {
