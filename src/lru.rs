@@ -1,6 +1,6 @@
 use std::{
     num::NonZeroUsize,
-    ops::{ControlFlow, Deref},
+    ops::Deref,
     process::abort,
     ptr::{self},
     sync::atomic::{self, AtomicUsize, Ordering},
@@ -156,7 +156,6 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         }
     }
 
-    #[inline]
     pub fn put(
         &self,
         key: impl Into<RefCounted<K>>,
@@ -323,136 +322,106 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         }
     }
 
-    fn put_node_after_head<'a, Op>(
+    fn put_node_after_head<'a>(
         &self,
         node: &Node<K, V>,
-        op: &Op,
+        op: &op::Attach,
         backoff: &Backoff,
         guard: &'a Guard,
-    ) -> ControlFlow<()>
-    where
-        Op: op::LruOperation<'a, K, V>,
-    {
+    ) {
         let node_ptr = Shared::from(ptr::from_ref(node));
-        let mut node_next = node.next.load(Ordering::Acquire, guard);
+        let mut node_next = Shared::from(ptr::from_ref(self.tail.as_ref()));
 
         let head = self.head.as_ref();
         let mut mru_node = head.next.load(Ordering::Acquire, guard);
 
-        let next = 'next_node: loop {
+        loop {
             // Another thread finished our job instead.
-            if op.is_finished(guard) {
-                return ControlFlow::Break(());
+            if <op::Attach as LruOperation<K, V>>::is_finished(op, guard) {
+                return;
             }
 
-            // If we load `head.next` and our operation is not done yet, that means the MRU node is
-            // valid or is our node. That's because all threads must help an op of a MRU node
-            // before updating `head.next`. In other words, at this point, `head.next` is already
-            // replaced with `node` or isn't changed from `mru_node`.
-
-            if ptr::eq(node, mru_node.as_raw()) {
-                break 'next_node node_next;
-            }
-
-            'change_node_next: loop {
-                let new_node_next = node.next.load(Ordering::Relaxed, guard);
-                if new_node_next.tag() != 0 {
-                    return ControlFlow::Break(());
+            loop {
+                let mru_prev = unsafe { mru_node.deref() }
+                    .prev
+                    .load(Ordering::Relaxed, guard);
+                if mru_prev.tag() != 0 {
+                    mru_node = self.help_link(head, mru_node, &Backoff::new(), guard);
+                    continue;
                 }
-                if !ptr::eq(new_node_next.as_raw(), node_next.as_raw()) {
+                if !ptr::eq(head, mru_prev.as_raw()) {
                     atomic::fence(Ordering::Acquire);
-                    let new_mru_node = head.next.load(Ordering::Relaxed, guard);
-                    // `head.next` is not `mru_node` any more
-                    if !ptr::eq(new_mru_node.as_raw(), mru_node.as_raw()) {
-                        atomic::fence(Ordering::Acquire);
-                        // Some thread helped us, try linking
-                        if ptr::eq(new_mru_node.as_raw(), node) {
-                            break 'next_node mru_node;
-                        }
-                        // `head.next` was changed to another node or our job was already done by another
-                        // thread. Retry.
-                        node_next = new_node_next;
-                        mru_node = new_mru_node;
-                        continue 'next_node;
-                    }
-                    // MRU node wasn't changed but only `node.next`. Some thread might helped us, so we
-                    // don't need to change `node.next`
-                    break 'change_node_next;
-                }
-
-                let mru_node_ref = unsafe { mru_node.deref() };
-                if !ptr::eq(mru_node_ref, node_next.as_raw()) {
-                    // Help a MRU node first
-                    if let Some(mru_desc) =
-                        unsafe { mru_node_ref.desc.load(Ordering::Relaxed, guard).as_ref() }
-                    {
-                        atomic::fence(Ordering::Acquire);
-                        mru_desc.run_op(self, mru_node_ref, backoff, guard);
-                    }
-
-                    let next_prev = mru_node_ref.prev.load(Ordering::Relaxed, guard);
-                    if next_prev.tag() != 0 {
-                        return ControlFlow::Continue(());
-                    }
-
-                    if ptr::eq(head, next_prev.as_raw()) {
-                        if mru_node_ref
-                            .prev
-                            .compare_exchange(
-                                Shared::from(ptr::from_ref(head)),
-                                node_ptr.with_tag(0),
-                                Ordering::Release,
-                                Ordering::Acquire,
-                                guard,
-                            )
-                            .is_err()
-                        {
-                            return ControlFlow::Continue(());
-                        };
-                    } else if !ptr::eq(node, next_prev.as_raw()) {
-                        atomic::fence(Ordering::Acquire);
-                        return ControlFlow::Continue(());
-                    }
-                    node.next
-                        .compare_exchange(
-                            Shared::from(ptr::from_ref(self.tail.as_ref())),
-                            mru_node.with_tag(0),
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                            guard,
-                        )
-                        .ok();
+                    mru_node = mru_prev;
+                    continue;
                 }
                 break;
             }
+            let mru_node_ref = unsafe { mru_node.deref() };
 
-            let new_mru_node = head.next.load(Ordering::Relaxed, guard);
-            if ptr::eq(new_mru_node.as_raw(), mru_node.as_raw()) {
-                if head
-                    .next
-                    .compare_exchange_weak(
-                        mru_node.with_tag(0),
-                        node_ptr.with_tag(0),
-                        Ordering::SeqCst,
-                        Ordering::Relaxed,
-                        guard,
-                    )
-                    .is_err()
-                {
-                    return ControlFlow::Continue(());
+            let new_node_next = {
+                let new_node_next = node.next.load(Ordering::Relaxed, guard);
+                if !ptr::eq(node_next.as_raw(), new_node_next.as_raw()) {
+                    Some(new_node_next)
+                } else {
+                    None
                 }
-                break mru_node;
-            } else if ptr::eq(new_mru_node.as_raw(), node) {
-                atomic::fence(Ordering::Acquire);
-                break mru_node;
-            } else {
-                atomic::fence(Ordering::Acquire);
-                assert!(op.is_finished(guard))
+            };
+            let new_node_next = new_node_next.or_else(|| {
+                if let Err(err) = node.next.compare_exchange_weak(
+                    node_next.with_tag(0),
+                    mru_node,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                    guard,
+                ) {
+                    Some(err.current)
+                } else {
+                    None
+                }
+            });
+            if let Some(next) = new_node_next {
+                if !ptr::eq(next.as_raw(), mru_node.as_raw()) {
+                    atomic::fence(Ordering::Acquire);
+                    if ptr::eq(
+                        unsafe { next.deref() }
+                            .prev
+                            .load(Ordering::Relaxed, guard)
+                            .as_raw(),
+                        node,
+                    ) {
+                        break;
+                    }
+                    // If `next.prev` is not `node`, it could be one of two cases:
+                    // - `node` was deleted so `next.prev` was changed to `node.prev`
+                    // - `node_next` is stale, we need to retry.
+                    if next.tag() != 0 {
+                        atomic::fence(Ordering::Acquire);
+                        return;
+                    }
+                    node_next = next;
+                    backoff.spin();
+                    continue;
+                }
             }
-        };
+            if let Err(err) = mru_node_ref.prev.compare_exchange_weak(
+                Shared::from(ptr::from_ref(head)),
+                node_ptr,
+                Ordering::Release,
+                Ordering::Relaxed,
+                guard,
+            ) {
+                if !ptr::eq(err.current.as_raw(), node) {
+                    atomic::fence(Ordering::Acquire);
+                    mru_node = err.current;
+                    backoff.spin();
+                    continue;
+                }
+            }
+            break;
+        }
 
-        self.help_link(node_ptr, unsafe { next.deref() }, backoff, guard);
-        ControlFlow::Break(())
+        <op::Attach as LruOperation<K, V>>::store_result(op, (), guard);
+        self.help_link(head, node_ptr, backoff, guard);
     }
 
     fn help_link<'a>(
@@ -653,7 +622,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
 }
 
 #[derive(Debug)]
-struct Node<K: Send + Sync, V: Send + Sync> {
+pub(crate) struct Node<K: Send + Sync, V: Send + Sync> {
     key: Option<RefCounted<K>>,
     next: Atomic<Node<K, V>>,
     prev: Atomic<Node<K, V>>,
@@ -765,7 +734,7 @@ mod op {
 
     use super::*;
 
-    pub trait LruOperation<'a, K, V>
+    pub(crate) trait LruOperation<'a, K, V>
     where
         K: Send + Sync + Ord + 'a,
         V: Send + Sync + 'a,
@@ -939,26 +908,11 @@ mod op {
             backoff: &Backoff,
             guard: &Guard,
         ) {
-            loop {
-                if LruOperation::<K, V>::is_finished(self, guard) {
-                    return;
-                }
-
-                if self.result.load(Ordering::Acquire) {
-                    break;
-                }
-
-                match lru_cache.put_node_after_head(node, self, &backoff, guard) {
-                    ControlFlow::Continue(_) => {
-                        backoff.spin();
-                        continue;
-                    }
-                    ControlFlow::Break(_) => {
-                        LruOperation::<K, V>::store_result(self, (), guard);
-                        break;
-                    }
-                }
+            if LruOperation::<K, V>::is_finished(self, guard) {
+                return;
             }
+
+            lru_cache.put_node_after_head(node, self, &backoff, guard);
         }
 
         fn store_result(&self, _: Self::Result, _: &'a Guard) -> bool {
