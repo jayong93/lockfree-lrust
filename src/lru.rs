@@ -331,7 +331,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         guard: &'a Guard,
     ) -> ControlFlow<()>
     where
-        Op: op::LruOperation<K, V>,
+        Op: op::LruOperation<'a, K, V>,
     {
         let node_ptr = Shared::from(ptr::from_ref(node));
         let mut node_next = node.next.load(Ordering::Acquire, guard);
@@ -610,7 +610,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
 
     fn detach_node<'a, Op>(&self, node: &Node<K, V>, op: &Op, backoff: &Backoff, guard: &'a Guard)
     where
-        Op: op::LruOperation<K, V>,
+        Op: op::LruOperation<'a, K, V>,
     {
         let mut prev;
         loop {
@@ -765,7 +765,13 @@ mod op {
 
     use super::*;
 
-    pub trait LruOperation<K: Send + Sync + Ord, V: Send + Sync> {
+    pub trait LruOperation<'a, K, V>
+    where
+        K: Send + Sync + Ord + 'a,
+        V: Send + Sync + 'a,
+    {
+        type Result;
+
         fn run_op(
             &self,
             lru_cache: &Lru<K, V>,
@@ -773,6 +779,7 @@ mod op {
             backoff: &Backoff,
             guard: &Guard,
         );
+        fn store_result(&self, result: Self::Result, guard: &'a Guard) -> bool;
         fn is_finished(&self, guard: &Guard) -> bool;
     }
 
@@ -791,11 +798,12 @@ mod op {
         }
     }
 
-    impl<K, V> LruOperation<K, V> for Remove<V>
+    impl<'a, K, V> LruOperation<'a, K, V> for Remove<V>
     where
-        K: Send + Sync + Ord,
-        V: Send + Sync,
+        K: Send + Sync + Ord + 'a,
+        V: Send + Sync + 'a,
     {
+        type Result = ();
         fn run_op(
             &self,
             lru_cache: &Lru<K, V>,
@@ -804,7 +812,15 @@ mod op {
             guard: &Guard,
         ) {
             lru_cache.detach_node(node, self, &backoff, guard);
-            self.result.fetch_or(true, Ordering::Release);
+            LruOperation::<K, V>::store_result(self, (), guard);
+        }
+
+        fn store_result(&self, _: Self::Result, _: &'a Guard) -> bool {
+            if self.result.load(Ordering::Relaxed) {
+                atomic::fence(Ordering::Acquire);
+                return false;
+            }
+            !self.result.fetch_or(true, Ordering::AcqRel)
         }
 
         fn is_finished(&self, _: &Guard) -> bool {
@@ -839,11 +855,13 @@ mod op {
         }
     }
 
-    impl<K, V> LruOperation<K, V> for Detach<K, V>
+    impl<'a, K, V> LruOperation<'a, K, V> for Detach<K, V>
     where
-        K: Send + Sync + Ord,
-        V: Send + Sync,
+        K: Send + Sync + Ord + 'a,
+        V: Send + Sync + 'a,
     {
+        type Result = Shared<'a, Node<K, V>>;
+
         fn run_op(
             &self,
             lru_cache: &Lru<K, V>,
@@ -874,23 +892,29 @@ mod op {
                     guard.defer_destroy(new_node);
                 }
             }
+            if LruOperation::<K, V>::store_result(self, inserted, guard) {
+                unsafe { guard.defer_destroy(Shared::from(ptr::from_ref(node))) };
+            }
+        }
 
+        fn store_result(&self, result: Self::Result, guard: &'a Guard) -> bool {
             let old_node = self.new_node.load(Ordering::Relaxed, guard);
             if old_node.tag() == 0 {
                 if self
                     .new_node
                     .compare_exchange(
                         old_node,
-                        inserted.with_tag(1),
+                        result.with_tag(1),
                         Ordering::Release,
                         Ordering::Acquire,
                         guard,
                     )
                     .is_ok()
                 {
-                    unsafe { guard.defer_destroy(Shared::from(ptr::from_ref(node))) };
+                    return true;
                 }
             }
+            false
         }
 
         fn is_finished(&self, guard: &Guard) -> bool {
@@ -902,11 +926,12 @@ mod op {
         result: AtomicBool,
     }
 
-    impl<K, V> LruOperation<K, V> for Attach
+    impl<'a, K, V> LruOperation<'a, K, V> for Attach
     where
-        K: Send + Sync + Ord,
-        V: Send + Sync,
+        K: Send + Sync + Ord + 'a,
+        V: Send + Sync + 'a,
     {
+        type Result = ();
         fn run_op(
             &self,
             lru_cache: &Lru<K, V>,
@@ -929,11 +954,19 @@ mod op {
                         continue;
                     }
                     ControlFlow::Break(_) => {
-                        self.result.fetch_or(true, Ordering::Release);
+                        LruOperation::<K, V>::store_result(self, (), guard);
                         break;
                     }
                 }
             }
+        }
+
+        fn store_result(&self, _: Self::Result, _: &'a Guard) -> bool {
+            if self.result.load(Ordering::Relaxed) {
+                atomic::fence(Ordering::Acquire);
+                return false;
+            }
+            !self.result.fetch_or(true, Ordering::AcqRel)
         }
 
         fn is_finished(&self, _: &Guard) -> bool {
@@ -1002,11 +1035,12 @@ mod op {
         }
     }
 
-    impl<K, V> LruOperation<K, V> for Insert<V>
+    impl<'a, K, V> LruOperation<'a, K, V> for Insert<V>
     where
-        K: Send + Sync + Ord,
-        V: Send + Sync,
+        K: Send + Sync + Ord + 'a,
+        V: Send + Sync + 'a,
     {
+        type Result = &'a RefCounted<V>;
         fn run_op(
             &self,
             lru_cache: &Lru<K, V>,
@@ -1025,18 +1059,22 @@ mod op {
                     backoff.spin();
                     continue;
                 };
-                if !self.value.make_constant(
-                    Some(&new_value),
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                    guard,
-                ) {
+                if !LruOperation::<K, V>::store_result(self, &new_value, guard) {
                     // Someone changed value. Retry.
                     backoff.spin();
                     continue;
                 }
                 break;
             }
+        }
+
+        fn store_result(&self, new_value: Self::Result, guard: &'a Guard) -> bool {
+            self.value.make_constant(
+                Some(&new_value),
+                Ordering::Release,
+                Ordering::Relaxed,
+                guard,
+            )
         }
 
         fn is_finished(&self, guard: &Guard) -> bool {
