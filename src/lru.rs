@@ -33,9 +33,9 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Drop for Lru<K, V
 
 impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
     pub fn new(capacity: NonZeroUsize) -> Self {
-        let mut head = Node::uninit(Atomic::null(), Atomic::null());
+        let mut head = Node::uninit();
         let head_ptr = head.as_ref() as *const Node<K, V>;
-        let mut tail = Node::uninit(Atomic::null(), Atomic::null());
+        let mut tail = Node::uninit();
         let tail_ptr = tail.as_ref() as *const Node<K, V>;
         head.next = tail_ptr.into();
         tail.prev = head_ptr.into();
@@ -72,7 +72,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     node = op.get_new_node(&guard);
                     continue;
                 }
-                Descriptor::Attach(op) => {
+                Descriptor::Insert(op) => {
                     atomic::fence(Ordering::Acquire);
                     op.run_op(self, node_ref, &backoff, &guard);
                     let value = op.clone_value(&guard);
@@ -120,7 +120,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     node = node_ref.prev.load(Ordering::Acquire, &guard);
                     continue;
                 }
-                Descriptor::Attach(op) => {
+                Descriptor::Insert(op) => {
                     atomic::fence(Ordering::Acquire);
                     op.run_op(self, node_ref, &backoff, &guard);
                     let value = op.clone_value(&guard);
@@ -163,7 +163,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         value: impl Into<RefCounted<V>>,
     ) -> Option<RefCounted<V>> {
         let guard = pin();
-        let new_node = Node::new(key, value, &guard);
+        let new_node = Node::new(key, value, self.head.as_ref(), self.tail.as_ref(), &guard);
         let new_node_ref = unsafe { new_node.deref() };
         let desc = new_node_ref.desc.load(Ordering::Relaxed, &guard);
         let desc_ref = unsafe { desc.deref() };
@@ -193,7 +193,9 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 // If the capacity is reached, remove LRU node.
                 if len >= self.cap.get() {
                     atomic::fence(Ordering::Acquire);
-                    self.pop_back();
+                    if self.pop_back().is_none() {
+                        abort();
+                    }
                 }
                 desc_ref.run_op(self, unsafe { node.deref() }, &backoff, &guard);
                 None
@@ -216,7 +218,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                             node = op.get_new_node(&guard);
                             continue 'desc_select;
                         }
-                        Descriptor::Attach(op) => {
+                        Descriptor::Insert(op) => {
                             atomic::fence(Ordering::Acquire);
                             match op.change_value(value.clone(), &guard) {
                                 Err(value) => {
@@ -285,7 +287,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     node = op.get_new_node(&guard);
                     continue;
                 }
-                Descriptor::Attach(op) => {
+                Descriptor::Insert(op) => {
                     atomic::fence(Ordering::Acquire);
                     if !LruOperation::<K, V>::is_finished(op, &guard)
                         || ptr::eq(
@@ -337,7 +339,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         let head = self.head.as_ref();
         let mut mru_node = head.next.load(Ordering::Acquire, guard);
 
-        let next = loop {
+        let next = 'next_node: loop {
             // Another thread finished our job instead.
             if op.is_finished(guard) {
                 return ControlFlow::Break(());
@@ -348,53 +350,105 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             // before updating `head.next`. In other words, at this point, `head.next` is already
             // replaced with `node` or isn't changed from `mru_node`.
 
-            let new_node_next = node.next.load(Ordering::Relaxed, guard);
-            if new_node_next != node_next {
-                atomic::fence(Ordering::Acquire);
-                let new_mru_node = head.next.load(Ordering::Relaxed, guard);
-                // `head.next` is still `mru_node` and only `node.next` was updated to `mru_node`
-                if new_mru_node == mru_node {
-                    break new_node_next;
-                }
-                // `head.next` was changed to our node so `node.next` should be updated already
-                if ptr::eq(new_mru_node.as_raw(), node) {
-                    break new_node_next;
-                }
-                // `head.next` was changed to another node or our job was already done by another
-                // thread. Retry.
-                atomic::fence(Ordering::Acquire);
-                node_next = new_node_next;
-                mru_node = new_mru_node;
-                continue;
-            }
-
-            // Another thread already set this node as a MRU node
             if ptr::eq(node, mru_node.as_raw()) {
-                break node_next;
+                break 'next_node node_next;
             }
 
-            let mru_node_ref = unsafe { mru_node.deref() };
-            if let Some(mru_desc) =
-                unsafe { mru_node_ref.desc.load(Ordering::Relaxed, guard).as_ref() }
-            {
+            'change_node_next: loop {
+                let new_node_next = node.next.load(Ordering::Relaxed, guard);
+                if new_node_next.tag() != 0 {
+                    return ControlFlow::Break(());
+                }
+                if !ptr::eq(new_node_next.as_raw(), node_next.as_raw()) {
+                    atomic::fence(Ordering::Acquire);
+                    let new_mru_node = head.next.load(Ordering::Relaxed, guard);
+                    // `head.next` is not `mru_node` any more
+                    if !ptr::eq(new_mru_node.as_raw(), mru_node.as_raw()) {
+                        atomic::fence(Ordering::Acquire);
+                        // Some thread helped us, try linking
+                        if ptr::eq(new_mru_node.as_raw(), node) {
+                            break 'next_node mru_node;
+                        }
+                        // `head.next` was changed to another node or our job was already done by another
+                        // thread. Retry.
+                        node_next = new_node_next;
+                        mru_node = new_mru_node;
+                        continue 'next_node;
+                    }
+                    // MRU node wasn't changed but only `node.next`. Some thread might helped us, so we
+                    // don't need to change `node.next`
+                    break 'change_node_next;
+                }
+
+                let mru_node_ref = unsafe { mru_node.deref() };
+                if !ptr::eq(mru_node_ref, node_next.as_raw()) {
+                    // Help a MRU node first
+                    if let Some(mru_desc) =
+                        unsafe { mru_node_ref.desc.load(Ordering::Relaxed, guard).as_ref() }
+                    {
+                        atomic::fence(Ordering::Acquire);
+                        mru_desc.run_op(self, mru_node_ref, backoff, guard);
+                    }
+
+                    let next_prev = mru_node_ref.prev.load(Ordering::Relaxed, guard);
+                    if next_prev.tag() != 0 {
+                        return ControlFlow::Continue(());
+                    }
+
+                    if ptr::eq(head, next_prev.as_raw()) {
+                        if mru_node_ref
+                            .prev
+                            .compare_exchange(
+                                Shared::from(ptr::from_ref(head)),
+                                node_ptr.with_tag(0),
+                                Ordering::Release,
+                                Ordering::Acquire,
+                                guard,
+                            )
+                            .is_err()
+                        {
+                            return ControlFlow::Continue(());
+                        };
+                    } else if !ptr::eq(node, next_prev.as_raw()) {
+                        atomic::fence(Ordering::Acquire);
+                        return ControlFlow::Continue(());
+                    }
+                    node.next
+                        .compare_exchange(
+                            Shared::from(ptr::from_ref(self.tail.as_ref())),
+                            mru_node.with_tag(0),
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                            guard,
+                        )
+                        .ok();
+                }
+                break;
+            }
+
+            let new_mru_node = head.next.load(Ordering::Relaxed, guard);
+            if ptr::eq(new_mru_node.as_raw(), mru_node.as_raw()) {
+                if head
+                    .next
+                    .compare_exchange_weak(
+                        mru_node.with_tag(0),
+                        node_ptr.with_tag(0),
+                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                        guard,
+                    )
+                    .is_err()
+                {
+                    return ControlFlow::Continue(());
+                }
+                break mru_node;
+            } else if ptr::eq(new_mru_node.as_raw(), node) {
                 atomic::fence(Ordering::Acquire);
-                mru_desc.run_op(self, mru_node_ref, backoff, guard);
+                break mru_node;
+            } else {
+                atomic::fence(Ordering::Acquire);
+                assert!(op.is_finished(guard))
             }
-
-            if head
-                .next
-                .compare_exchange_weak(
-                    mru_node.with_tag(0),
-                    node_ptr.with_tag(0),
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
-                    guard,
-                )
-                .is_err()
-            {
-                return ControlFlow::Continue(());
-            }
-            break mru_node;
         };
 
         self.help_link(node_ptr, unsafe { next.deref() }, backoff, guard);
@@ -598,6 +652,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
     }
 }
 
+#[derive(Debug)]
 struct Node<K: Send + Sync, V: Send + Sync> {
     key: Option<RefCounted<K>>,
     next: Atomic<Node<K, V>>,
@@ -608,7 +663,7 @@ struct Node<K: Send + Sync, V: Send + Sync> {
 impl<K: Send + Sync, V: Send + Sync> Drop for Node<K, V> {
     fn drop(&mut self) {
         let desc = std::mem::replace(&mut self.desc, Atomic::null());
-        drop(unsafe { desc.into_owned() });
+        drop(unsafe { desc.try_into_owned() });
     }
 }
 
@@ -617,27 +672,30 @@ impl<K: Send + Sync, V: Send + Sync> Node<K, V> {
     fn new<'a>(
         key: impl Into<RefCounted<K>>,
         value: impl Into<RefCounted<V>>,
-        _: &'a Guard,
+        head: &Node<K, V>,
+        tail: &Node<K, V>,
+        guard: &'a Guard,
     ) -> Shared<'a, Self> {
-        let ptr = Box::leak(
-            Owned::new(Self {
-                key: Some(key.into()),
-                next: Atomic::null(),
-                prev: Atomic::null(),
-                desc: Atomic::null(),
-            })
-            .into_box(),
+        let ptr = Owned::new(Self {
+            key: Some(key.into()),
+            next: Atomic::from(ptr::from_ref(tail)),
+            prev: Atomic::from(ptr::from_ref(head)),
+            desc: Atomic::null(),
+        })
+        .into_shared(guard);
+        unsafe { ptr.deref() }.desc.store(
+            Owned::new(Descriptor::Insert(op::Insert::new(value.into()))),
+            Ordering::Relaxed,
         );
-        ptr.desc = Atomic::new(Descriptor::Attach(op::Attach::new(value.into())));
-        Shared::from(ptr::from_ref(ptr))
+        ptr
     }
 
     #[inline]
-    fn uninit<'a>(next: Atomic<Node<K, V>>, prev: Atomic<Node<K, V>>) -> Owned<Self> {
+    fn uninit<'a>() -> Owned<Self> {
         Owned::new(Self {
             key: None,
-            next,
-            prev,
+            next: Atomic::null(),
+            prev: Atomic::null(),
             desc: Atomic::null(),
         })
     }
@@ -675,7 +733,7 @@ where
     Remove(op::Remove<V>),
     /// The node is removed but another node with the same key-value will be inserted.
     Detach(op::Detach<K, V>),
-    Attach(op::Attach<V>),
+    Insert(op::Insert<V>),
 }
 
 impl<K, V> Descriptor<K, V>
@@ -685,7 +743,7 @@ where
 {
     fn clone_value(&self, guard: &Guard) -> RefCounted<V> {
         match self {
-            Self::Attach(op) => op.clone_value(guard),
+            Self::Insert(op) => op.clone_value(guard),
             Self::Remove(op) => op.value.clone(),
             Self::Detach(op) => op.value.clone(),
         }
@@ -697,7 +755,7 @@ where
         match self {
             Self::Remove(op) => op.run_op(lru_cache, node, backoff, guard),
             Self::Detach(op) => op.run_op(lru_cache, node, backoff, guard),
-            Self::Attach(op) => op.run_op(lru_cache, node, backoff, guard),
+            Self::Insert(op) => op.run_op(lru_cache, node, backoff, guard),
         }
     }
 }
@@ -796,7 +854,13 @@ mod op {
             lru_cache.detach_node(node, self, &backoff, guard);
             let key = node.key.as_ref().unwrap().clone();
             let value = self.value.clone();
-            let new_node = Node::new(key.clone(), value, guard);
+            let new_node = Node::new(
+                key.clone(),
+                value,
+                lru_cache.head.as_ref(),
+                lru_cache.tail.as_ref(),
+                guard,
+            );
             let new_entry =
                 lru_cache
                     .skiplist
@@ -834,15 +898,62 @@ mod op {
         }
     }
 
-    pub struct Attach<T>
+    pub struct Attach {
+        result: AtomicBool,
+    }
+
+    impl<K, V> LruOperation<K, V> for Attach
+    where
+        K: Send + Sync + Ord,
+        V: Send + Sync,
+    {
+        fn run_op(
+            &self,
+            lru_cache: &Lru<K, V>,
+            node: &Node<K, V>,
+            backoff: &Backoff,
+            guard: &Guard,
+        ) {
+            loop {
+                if LruOperation::<K, V>::is_finished(self, guard) {
+                    return;
+                }
+
+                if self.result.load(Ordering::Acquire) {
+                    break;
+                }
+
+                match lru_cache.put_node_after_head(node, self, &backoff, guard) {
+                    ControlFlow::Continue(_) => {
+                        backoff.spin();
+                        continue;
+                    }
+                    ControlFlow::Break(_) => {
+                        self.result.fetch_or(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+        }
+
+        fn is_finished(&self, _: &Guard) -> bool {
+            if self.result.load(Ordering::Relaxed) {
+                atomic::fence(Ordering::Acquire);
+                return true;
+            }
+            false
+        }
+    }
+
+    pub struct Insert<T>
     where
         T: Send + Sync,
     {
+        attach: Attach,
         value: AtomicRefCounted<T>,
-        is_attached: AtomicBool,
     }
 
-    impl<T> Attach<T>
+    impl<T> Insert<T>
     where
         T: Send + Sync,
     {
@@ -850,7 +961,9 @@ mod op {
         pub fn new(value: RefCounted<T>) -> Self {
             Self {
                 value: AtomicRefCounted::new(value),
-                is_attached: AtomicBool::new(false),
+                attach: Attach {
+                    result: AtomicBool::new(false),
+                },
             }
         }
 
@@ -889,7 +1002,7 @@ mod op {
         }
     }
 
-    impl<K, V> LruOperation<K, V> for Attach<V>
+    impl<K, V> LruOperation<K, V> for Insert<V>
     where
         K: Send + Sync + Ord,
         V: Send + Sync,
@@ -901,26 +1014,7 @@ mod op {
             backoff: &Backoff,
             guard: &Guard,
         ) {
-            loop {
-                if LruOperation::<K, V>::is_finished(self, guard) {
-                    return;
-                }
-
-                if self.is_attached.load(Ordering::Acquire) {
-                    break;
-                }
-
-                match lru_cache.put_node_after_head(node, self, &backoff, guard) {
-                    ControlFlow::Continue(_) => {
-                        backoff.spin();
-                        continue;
-                    }
-                    ControlFlow::Break(_) => {
-                        self.is_attached.fetch_or(true, Ordering::Release);
-                        break;
-                    }
-                }
-            }
+            LruOperation::run_op(&self.attach, lru_cache, node, backoff, guard);
             loop {
                 let Ok(new_value) = self
                     .value
