@@ -457,71 +457,71 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
 
     fn help_link<'a>(
         &self,
-        mut prev: Shared<'a, Node<K, V>>,
         node: &'a Node<K, V>,
+        mut next: Shared<'a, Node<K, V>>,
         backoff: &Backoff,
         guard: &'a Guard,
     ) -> Shared<'a, Node<K, V>> {
         let mut last = Shared::<Node<K, V>>::null();
         loop {
-            if prev.is_null() {
+            if next.is_null() {
                 abort();
             }
-            let prev_ref = unsafe { prev.as_ref().unwrap() };
-            let prev_next = prev_ref.next.load(Ordering::Relaxed, guard);
-            if prev_next.tag() != 0 {
-                // A thread who was tried to remove `prev` don't update `last`'s next pointer yet.
+            let next_ref = unsafe { next.deref() };
+            let next_prev = next_ref.prev.load(Ordering::Relaxed, guard);
+            if next_prev.tag() != 0 {
+                // A thread who was tried to remove `next` don't update `last`'s prev pointer yet.
                 // We will update it instead.
                 if !last.is_null() {
-                    prev_ref.mark_prev(backoff, guard);
+                    next_ref.mark_next(backoff, guard);
                     unsafe { last.deref() }
-                        .next
+                        .prev
                         .compare_exchange(
-                            Shared::from(ptr::from_ref(prev_ref)),
-                            prev_next.with_tag(0),
+                            Shared::from(ptr::from_ref(next_ref)),
+                            next_prev.with_tag(0),
                             Ordering::Release,
                             Ordering::Acquire,
                             guard,
                         )
                         .ok();
-                    prev = last;
+                    next = last;
                     last = Shared::null();
                 } else {
                     // Find a previous node which is not deleted.
-                    prev = prev_ref.prev.load(Ordering::Relaxed, guard);
+                    next = next_ref.next.load(Ordering::Relaxed, guard);
                 }
                 continue;
             }
-            let node_prev = node.prev.load(Ordering::Relaxed, guard);
+            let node_next = node.next.load(Ordering::Relaxed, guard);
             // The node was removed by another thread. Pass responsibility of clean-up to that thread.
-            if node_prev.tag() != 0 {
-                return prev;
+            if node_next.tag() != 0 {
+                return next;
             }
             // Found a non-deleted previous node and set it as `last`.
-            if !ptr::eq(prev_next.as_raw(), node) {
-                last = prev;
-                prev = prev_next;
+            if !ptr::eq(next_prev.as_raw(), node) {
+                last = next;
+                next = next_prev;
                 continue;
             }
             // Another thread already helped our job.
-            if ptr::eq(node_prev.as_raw(), prev.as_raw()) {
-                return prev;
+            if ptr::eq(node_next.as_raw(), next.as_raw()) {
+                return next;
             }
-            let prev_next = prev_ref.next.load(Ordering::Relaxed, guard);
-            if ptr::eq(prev_next.as_raw(), node)
+            let next_prev = next_ref.prev.load(Ordering::Relaxed, guard);
+            if ptr::eq(node, next_prev.as_raw())
                 && node
-                    .prev
+                    .next
                     .compare_exchange_weak(
-                        node_prev,
-                        prev.with_tag(0),
+                        node_next,
+                        next.with_tag(0),
                         Ordering::Release,
                         Ordering::Acquire,
                         guard,
                     )
                     .is_ok()
             {
-                if prev_ref.prev.load(Ordering::Relaxed, guard).tag() == 0 {
-                    return prev;
+                if next_ref.next.load(Ordering::Relaxed, guard).tag() == 0 {
+                    return next;
                 }
             }
             backoff.spin();
@@ -529,13 +529,13 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
     }
 
     fn help_detach<'a>(&self, node: &Node<K, V>, backoff: &Backoff, guard: &'a Guard) {
-        node.mark_prev(backoff, guard);
+        node.mark_next(backoff, guard);
         let mut last = Shared::<Node<K, V>>::null();
         let mut prev = node.prev.load(Ordering::Relaxed, guard);
-        if prev.is_null() {
+        let mut next = node.next.load(Ordering::Relaxed, guard);
+        if next.is_null() {
             abort()
         }
-        let mut next = node.next.load(Ordering::Relaxed, guard);
         loop {
             // Not need to null check for `prev`/`next` because if they are set as head/tail
             // once, they will not go backward/forward any more. That is because head/tail
@@ -545,57 +545,57 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             if ptr::eq(prev.as_raw(), next.as_raw()) {
                 return;
             }
-            let next_ref = unsafe { next.deref() };
-            let next_next = next_ref.next.load(Ordering::Relaxed, guard);
-            if next_next.tag() != 0 {
-                next_ref.mark_prev(backoff, guard);
-                next = next_next.as_raw().into();
+            let prev_ref = unsafe { prev.deref() };
+            let prev_prev = prev_ref.prev.load(Ordering::Relaxed, guard);
+            if prev_prev.tag() != 0 {
+                prev_ref.mark_next(backoff, guard);
+                prev = prev_prev.as_raw().into();
                 continue;
             }
-            let prev_ref = unsafe { prev.deref() };
-            let prev_next = prev_ref.next.load(Ordering::Relaxed, guard);
+            let next_ref = unsafe { next.deref() };
+            let next_prev = next_ref.prev.load(Ordering::Relaxed, guard);
             // If `prev` was deleted
-            if prev_next.tag() != 0 {
-                // A thread who was tried to remove `prev` don't update `last`'s next pointer yet.
+            if next_prev.tag() != 0 {
+                // A thread who was tried to remove `next` don't update `last`'s prev pointer yet.
                 // We will update it instead.
                 if !last.is_null() {
-                    prev_ref.mark_prev(backoff, guard);
+                    next_ref.mark_next(backoff, guard);
                     unsafe { last.deref() }
-                        .next
+                        .prev
                         .compare_exchange(
-                            prev.with_tag(0),
-                            prev_next.with_tag(0),
+                            next.with_tag(0),
+                            next_prev.with_tag(0),
                             Ordering::Release,
                             Ordering::Relaxed,
                             guard,
                         )
                         .ok();
-                    prev = last;
+                    next = last;
                     last = Shared::null();
                 } else {
-                    // Find a previous node which is not deleted.
-                    prev = prev_ref.prev.load(Ordering::Relaxed, guard);
-                    if prev.is_null() {
+                    // Find a next node which is not deleted.
+                    next = next_ref.next.load(Ordering::Relaxed, guard);
+                    if next.is_null() {
                         abort()
                     }
                 }
                 continue;
             }
             // Found a non-deleted previous node and set it as `last`.
-            if !ptr::eq(prev_next.as_raw(), node) {
-                last = prev;
-                prev = prev_next;
-                if prev.is_null() {
+            if !ptr::eq(next_prev.as_raw(), node) {
+                last = next;
+                next = next_prev;
+                if next.is_null() {
                     abort()
                 }
                 continue;
             }
 
-            if prev_ref
-                .next
+            if next_ref
+                .prev
                 .compare_exchange_weak(
-                    Shared::from(node as *const _),
-                    next.with_tag(0),
+                    Shared::from(ptr::from_ref(node)),
+                    prev.with_tag(0),
                     Ordering::Release,
                     Ordering::Relaxed,
                     guard,
@@ -612,29 +612,29 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
     where
         Op: op::LruOperation<K, V>,
     {
-        let mut next;
+        let mut prev;
         loop {
-            next = node.next.load(Ordering::Acquire, guard);
+            prev = node.prev.load(Ordering::Acquire, guard);
             if op.is_finished(guard) {
                 return;
             }
             // Another thread already marked this node
-            if next.tag() != 0 {
+            if prev.tag() != 0 {
                 break;
             }
-            if let Err(err) = node.next.compare_exchange_weak(
-                next,
-                next.with_tag(1),
+            if let Err(err) = node.prev.compare_exchange_weak(
+                prev,
+                prev.with_tag(1),
                 Ordering::Release,
                 Ordering::Relaxed,
                 guard,
             ) {
-                // Another thread removed the next node and update `next` pointer of this node
+                // Another thread removed the prev node and update `prev` pointer of this node
                 if err.current.tag() == 0 {
                     atomic::fence(Ordering::Acquire);
                     self.help_link(
-                        Shared::from(ptr::from_ref(node)),
                         unsafe { err.current.deref() },
+                        Shared::from(ptr::from_ref(node)),
                         backoff,
                         guard,
                     );
@@ -647,8 +647,8 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         }
 
         self.help_detach(node, backoff, guard);
-        let prev = node.prev.load(Ordering::Acquire, guard);
-        self.help_link(prev, unsafe { next.deref() }, backoff, guard);
+        let next = node.next.load(Ordering::Acquire, guard);
+        self.help_link(unsafe { prev.deref() }, next, backoff, guard);
     }
 }
 
@@ -700,17 +700,17 @@ impl<K: Send + Sync, V: Send + Sync> Node<K, V> {
         })
     }
 
-    fn mark_prev(&self, backoff: &Backoff, guard: &Guard) {
+    fn mark_next(&self, backoff: &Backoff, guard: &Guard) {
         loop {
-            let prev = self.prev.load(Ordering::Acquire, guard);
-            if prev.tag() != 0 {
+            let next = self.next.load(Ordering::Acquire, guard);
+            if next.tag() != 0 {
                 return;
             }
             if self
-                .prev
+                .next
                 .compare_exchange_weak(
-                    prev,
-                    prev.with_tag(1),
+                    next,
+                    next.with_tag(1),
                     Ordering::Release,
                     Ordering::Relaxed,
                     guard,
