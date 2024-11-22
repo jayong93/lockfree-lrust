@@ -437,20 +437,32 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         backoff: &Backoff,
         guard: &'a Guard,
     ) -> Shared<'a, Node<K, V>> {
-        let mut last_link_deleted = true;
+        let mut last: Shared<'a, Node<K, V>> = Shared::null();
         let mut next_history = Vec::with_capacity(40);
         loop {
             next_history.push(next);
             let next_ref = unsafe { next.deref() };
             let next_prev = next_ref.prev.load(Ordering::Acquire, guard);
             if next_prev.tag() != 0 {
-                if !last_link_deleted {
-                    self.help_detach(next_ref, backoff, guard);
-                    last_link_deleted = true;
+                if !last.is_null() {
+                    next_ref.mark_next(backoff, guard);
+                    unsafe { last.deref() }
+                        .prev
+                        .compare_exchange(
+                            next.with_tag(0),
+                            next_prev.with_tag(0),
+                            Ordering::Release,
+                            Ordering::Acquire,
+                            guard,
+                        )
+                        .ok();
+                    next = last;
+                    last = Shared::null();
+                } else {
+                    next = next_ref.next.load(Ordering::Acquire, guard).with_tag(0);
+                    assert!(!ptr::eq(self.head.as_ref(), next.as_raw()));
+                    assert!(!next.is_null());
                 }
-                next = next_ref.next.load(Ordering::Acquire, guard).with_tag(0);
-                assert!(!ptr::eq(self.head.as_ref(), next.as_raw()));
-                assert!(!next.is_null());
                 continue;
             }
             let node_next = node.next.load(Ordering::Relaxed, guard);
@@ -462,7 +474,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             }
             // Found a non-deleted previous node and set it as `last`.
             if !ptr::eq(next_prev.as_raw(), node) {
-                last_link_deleted = false;
+                last = next;
                 assert!(!ptr::eq(next_prev.as_raw(), self.head.as_ref()));
                 assert!(!next_prev.is_null());
                 assert!(!ptr::eq(self.head.as_ref(), next.as_raw()));
@@ -498,7 +510,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
 
     fn help_detach<'a>(&self, node: &Node<K, V>, backoff: &Backoff, guard: &'a Guard) {
         node.mark_next(backoff, guard);
-        let mut last_link_deleted = true;
+        let mut last: Shared<'a, Node<K, V>> = Shared::null();
         let mut prev = node.prev.load(Ordering::Acquire, guard);
         let mut next = node.next.load(Ordering::Acquire, guard);
         if next.is_null() {
@@ -524,18 +536,30 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             let next_prev = next_ref.prev.load(Ordering::Acquire, guard);
             // If `prev` was deleted
             if next_prev.tag() != 0 {
-                if !last_link_deleted {
-                    self.help_detach(next_ref, backoff, guard);
-                    last_link_deleted = true;
+                if !last.is_null() {
+                    next_ref.mark_next(backoff, guard);
+                    unsafe { last.deref() }
+                        .prev
+                        .compare_exchange(
+                            next.with_tag(0),
+                            next_prev.with_tag(0),
+                            Ordering::Release,
+                            Ordering::Acquire,
+                            guard,
+                        )
+                        .ok();
+                    next = last;
+                    last = Shared::null();
+                } else {
+                    next = next_ref.next.load(Ordering::Acquire, guard).with_tag(0);
+                    assert!(!next.is_null());
                 }
                 // Find a next node which is not deleted.
-                next = next_ref.next.load(Ordering::Acquire, guard).with_tag(0);
-                assert!(!next.is_null());
                 continue;
             }
             // Found a non-deleted previous node and set it as `last`.
             if !ptr::eq(next_prev.as_raw(), node) {
-                last_link_deleted = false;
+                last = next;
                 assert!(!next_prev.is_null());
                 next = next_prev;
                 continue;
