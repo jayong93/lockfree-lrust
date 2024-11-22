@@ -10,5 +10,5 @@ fn test_no_eviction() {
                     cache.put(i % 99 + 1, i);
                 }
         }
-    assert_eq!(cache.size(), 99);
+    assert_eq!(cache.len(), 99);
 }

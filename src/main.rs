@@ -8,8 +8,8 @@ fn main() {
     std::thread::scope(|s| {
         for _ in 0..8 {
             s.spawn(|| {
-                for i in 0..1000000 {
-                    cache.put(i % 98 + 1, i);
+                for i in 0..10000000 {
+                    cache.put(i % 200 + 1, i);
                 }
             });
         }
@@ -17,6 +17,6 @@ fn main() {
     // for i in 0..1000000 {
     //     cache.put(i % 98 + 1, i);
     // }
-    assert_eq!(cache.size(), 98);
+    assert_eq!(cache.len(), 100);
     println!("done");
 }
