@@ -364,7 +364,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             if let Err(err) = mru_node_ref.prev.compare_exchange_weak(
                 Shared::from(ptr::from_ref(head)),
                 node_ptr.with_tag(0),
-                Ordering::SeqCst,
+                Ordering::Release,
                 Ordering::Relaxed,
                 guard,
             ) {
@@ -415,7 +415,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 .compare_exchange_weak(
                     head_next.with_tag(0),
                     node_ptr.with_tag(0),
-                    Ordering::SeqCst,
+                    Ordering::Release,
                     Ordering::Relaxed,
                     guard,
                 )
@@ -478,7 +478,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 .compare_exchange_weak(
                     node_next,
                     next.with_tag(0),
-                    Ordering::SeqCst,
+                    Ordering::Release,
                     Ordering::Acquire,
                     guard,
                 )
@@ -513,6 +513,9 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             {
                 let prev_prev = prev_ref.prev.load(Ordering::Acquire, guard);
                 if prev_prev.tag() != 0 {
+                    // If we don't mark next here, concurrent `help_link` might not recognize that
+                    // this node was deleted.
+                    prev_ref.mark_next(backoff, guard);
                     prev = prev_prev.with_tag(0);
                     continue;
                 }
@@ -548,8 +551,8 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 .compare_exchange_weak(
                     Shared::from(ptr::from_ref(node)),
                     prev.with_tag(0),
-                    Ordering::SeqCst,
-                    Ordering::Acquire,
+                    Ordering::Release,
+                    Ordering::Relaxed,
                     guard,
                 )
                 .is_ok()
@@ -614,7 +617,7 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
                 .compare_exchange_weak(
                     next,
                     next.with_tag(1),
-                    Ordering::SeqCst,
+                    Ordering::Release,
                     Ordering::Relaxed,
                     guard,
                 )
