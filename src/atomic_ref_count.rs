@@ -26,7 +26,7 @@ impl<T: Send + Sync> From<T> for RefCounted<T> {
 impl<T: Send + Sync> Clone for RefCounted<T> {
     fn clone(&self) -> Self {
         let inner = unsafe { self.inner.as_ref() };
-        inner.try_increment_strong();
+        inner.try_increment();
         Self {
             inner: unsafe { NonNull::new_unchecked(ptr::from_ref(inner).cast_mut()) },
         }
@@ -36,7 +36,7 @@ impl<T: Send + Sync> Clone for RefCounted<T> {
 impl<T: Send + Sync> Drop for RefCounted<T> {
     fn drop(&mut self) {
         unsafe {
-            self.inner.as_ref().decrement_strong();
+            self.inner.as_ref().decrement();
         }
     }
 }
@@ -157,7 +157,7 @@ impl<T: Send + Sync> Drop for AtomicRefCounted<T> {
                 .as_ref()
         } {
             atomic::fence(Ordering::Acquire);
-            inner.decrement_strong();
+            inner.decrement();
         }
     }
 }
@@ -208,7 +208,7 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     ) -> Result<Option<RefCounted<T>>, ()> {
         let inner = self.inner.load(order, guard);
         if let Some(inner) = unsafe { inner.as_ref() } {
-            if inner.try_increment_strong() {
+            if inner.try_increment() {
                 Ok(Some(unsafe { RefCounted::from_inner_raw(inner.into()) }))
             } else {
                 Err(())
@@ -273,7 +273,7 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
             Err(err) => Err(CompareExchangeErr {
                 current: unsafe {
                     err.current.as_ref().map(|inner| {
-                        if inner.try_increment_strong() {
+                        if inner.try_increment() {
                             CompareExchangeErrCuurentValue::Cloned(RefCounted::from_inner_raw(
                                 inner.into(),
                             ))
@@ -378,32 +378,22 @@ pub struct CompareExchangeErr<'a, T: Send + Sync> {
     pub new: Option<RefCounted<T>>,
 }
 
-#[repr(transparent)]
-pub struct WeakRefCounted<T>
-where
-    T: Send + Sync,
-{
-    inner: NonNull<RefCountedInner<T>>,
-}
-
 #[repr(C)]
 struct RefCountedInner<T: Send + Sync> {
     data: T,
     ref_count: AtomicUsize,
-    weak_count: AtomicUsize,
 }
 
 impl<T: Send + Sync> RefCountedInner<T> {
     fn new(data: T) -> Self {
         Self {
             ref_count: AtomicUsize::new(1),
-            weak_count: AtomicUsize::new(1),
             data,
         }
     }
 
     #[inline]
-    fn try_increment_strong(&self) -> bool {
+    fn try_increment(&self) -> bool {
         let mut old_count = self.ref_count.load(Ordering::Relaxed);
 
         loop {
@@ -428,18 +418,7 @@ impl<T: Send + Sync> RefCountedInner<T> {
     }
 
     #[inline]
-    fn decrement_strong(&self) {
-        if self.ref_count.fetch_sub(1, Ordering::Release) == 1 {
-            atomic::fence(Ordering::Acquire);
-            // This line should be called once because otherwise `Self::finalize` might be called
-            // with `self` pointer which was already deallocated by another thread
-            let this = ptr::from_ref(self);
-            unsafe { guard.defer_unchecked(move || Self::finalize(this)) };
-        }
-    }
-
-    #[inline]
-    fn decrement_strong(&self) {
+    fn decrement(&self) {
         if self.ref_count.fetch_sub(1, Ordering::Release) == 1 {
             atomic::fence(Ordering::Acquire);
             let guard = pin();

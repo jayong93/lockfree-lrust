@@ -8,7 +8,7 @@ fn main() {
     std::thread::scope(|s| {
         for _ in 0..8 {
             s.spawn(|| {
-                for i in 0..10000000 {
+                for i in 0..1000000 {
                     cache.put(i % 200 + 1, i);
                 }
             });
