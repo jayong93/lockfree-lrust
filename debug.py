@@ -18,7 +18,9 @@ def set_ptr_type(ty: lldb.SBType):
 
 
 def run_expr(expr: str):
-    print(lldb.frame.EvaluateExpression(expr))
+    value = lldb.value(lldb.frame.EvaluateExpression(expr))
+    print(value)
+    return value
 
 
 def value_as_node(value: lldb.SBValue | lldb.value, output=False):
