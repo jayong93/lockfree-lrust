@@ -123,17 +123,6 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 }
                 Descriptor::Detach(op) => {
                     op.run_op(self, node_ref, &Backoff::new(), &guard);
-                    let new_node = op.get_new_node(&guard);
-                    unsafe {
-                        let new_desc = new_node.deref().desc.load(Ordering::Relaxed, &guard);
-                        match new_desc.deref() {
-                            Descriptor::Insert(op) => {
-                                op.attach
-                                    .run_op(self, new_node.deref(), &Backoff::new(), &guard);
-                            }
-                            _ => {}
-                        }
-                    }
                 }
                 Descriptor::Insert(op) => {
                     op.run_op(self, node_ref, &Backoff::new(), &guard);
@@ -206,7 +195,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 // If the capacity is reached, remove LRU node.
                 if len >= self.cap.get() {
                     atomic::fence(Ordering::Acquire);
-                    assert!(self.pop_back().is_some());
+                    self.pop_back();
                 }
                 desc_ref.run_op(self, unsafe { node.deref() }, &backoff, &guard);
                 None
@@ -270,6 +259,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         }
                         break (new_desc, old_value);
                     }
+                    drop(unsafe { new_desc.into_owned() });
                     backoff.spin();
                 };
 
@@ -947,7 +937,6 @@ mod op {
             guard: &Guard,
         ) -> bool {
             if !LruOperation::<K, V>::is_finished(self, guard) {
-                LruOperation::<K, V>::run_op(&self.remove, lru_cache, node, backoff, guard);
                 let key = node.key.as_ref().unwrap().clone();
                 let value = self.remove.value.clone();
                 let Some(entry) = lru_cache.skiplist.get(&key) else {
@@ -996,9 +985,17 @@ mod op {
                 } else {
                     new_node
                 };
-                return LruOperation::<K, V>::store_result(self, result, guard);
+
+                let new_desc =
+                    unsafe { result.deref().desc.load(Ordering::Relaxed, guard).deref() };
+                if let Descriptor::Insert(new_op) = new_desc {
+                    new_op
+                        .attach
+                        .run_op(lru_cache, unsafe { result.deref() }, backoff, guard);
+                };
+                LruOperation::<K, V>::store_result(self, result, guard);
             }
-            false
+            return LruOperation::<K, V>::run_op(&self.remove, lru_cache, node, backoff, guard);
         }
 
         fn store_result(&self, result: Self::Result, guard: &'a Guard) -> bool {
