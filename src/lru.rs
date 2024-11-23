@@ -93,6 +93,9 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     ) {
                         self.size.fetch_sub(1, Ordering::Relaxed);
                         unsafe { new.deref() }.run_op(self, node_ref, &backoff, &guard);
+                        entry.remove();
+                        decrease_removed_node(node.as_raw(), line!(), &guard);
+                        unsafe { guard.defer_destroy(node) };
                         unsafe {
                             guard.defer_destroy(old_desc);
                         }
@@ -145,6 +148,19 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     ) {
                         self.size.fetch_sub(1, Ordering::Relaxed);
                         unsafe { new.deref() }.run_op(self, node_ref, &Backoff::new(), &guard);
+                        if let Some(entry) =
+                            self.skiplist.get(node_ref.key.as_ref().unwrap().deref())
+                        {
+                            if ptr::eq(
+                                entry.value().load(Ordering::Relaxed, &guard).as_raw(),
+                                node_ref,
+                            ) {
+                                entry.remove();
+                            }
+                        }
+
+                        decrease_removed_node(node.as_raw(), line!(), &guard);
+                        unsafe { guard.defer_destroy(node) };
                         unsafe {
                             guard.defer_destroy(old_desc);
                         }
@@ -170,7 +186,17 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
 
         'outer: loop {
             let key = new_node_ref.key.as_ref().unwrap().clone();
-            let entry = self.skiplist.get_or_insert(key, Atomic::from(new_node));
+            let entry = self
+                .skiplist
+                .compare_insert(key, Atomic::from(new_node), |value| {
+                    let node = value.load(Ordering::Relaxed, &guard);
+                    let node_ref = unsafe { node.deref() };
+                    let desc_ref = unsafe { node_ref.desc.load(Ordering::Relaxed, &guard).deref() };
+                    if let Descriptor::Remove(_) = desc_ref {
+                        return true;
+                    }
+                    false
+                });
             let mut node = entry.value().load(Ordering::Acquire, &guard);
 
             let old_value = if ptr::eq(node.as_raw(), new_node_ref) {
@@ -180,7 +206,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 // If the capacity is reached, remove LRU node.
                 if len >= self.cap.get() {
                     atomic::fence(Ordering::Acquire);
-                    self.pop_back();
+                    assert!(self.pop_back().is_some());
                 }
                 desc_ref.run_op(self, unsafe { node.deref() }, &backoff, &guard);
                 None
@@ -194,7 +220,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 // If the capacity is reached, remove LRU node.
                 if len >= self.cap.get() {
                     atomic::fence(Ordering::Acquire);
-                    self.pop_back();
+                    assert!(self.pop_back().is_some());
                 }
                 None
             } else {
@@ -207,11 +233,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     let new_desc = match old_desc_ref {
                         // The node was removed, try to allocate a new node
                         Descriptor::Remove(op) => {
-                            op.run_op(self, node_ref, &backoff, &guard);
-                            if entry.remove() {
-                                decrease_removed_node(node.as_raw(), line!(), &guard);
-                                unsafe { guard.defer_destroy(node) };
-                            }
+                            op.link_prev.run_op(self, node_ref, &backoff, &guard);
                             continue 'outer;
                         }
                         Descriptor::Detach(op) => {
