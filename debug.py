@@ -1,14 +1,18 @@
 import lldb
 
-pointer_ty = None
+pointer_ty: lldb.SBType | None = None
+desc_ptr_ty: lldb.SBType | None = None
 
 
 def init_head(head_expr: str):
-    global pointer_ty
+    global pointer_ty, desc_ptr_ty
     pointer_ty = (
         lldb.frame.GetValueForVariablePath(head_expr)
         .type.template_args[0]
         .GetPointerType()
+    )
+    desc_ptr_ty = (
+        pointer_ty.GetPointeeType().members[-1].type.template_args[0].GetPointerType()
     )
 
 

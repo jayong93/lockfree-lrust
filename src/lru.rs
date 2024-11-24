@@ -78,6 +78,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 }
                 Descriptor::Detach(op) => {
                     op.run_op(self, node_ref, &backoff, &guard);
+                    assert!(op.is_finished(&guard));
                     node = op.get_new_node(&guard);
                 }
                 Descriptor::Insert(op) => {
@@ -93,7 +94,12 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     ) {
                         self.size.fetch_sub(1, Ordering::Relaxed);
                         unsafe { new.deref() }.run_op(self, node_ref, &backoff, &guard);
+                        atomic::fence(Ordering::Release);
                         entry.remove();
+                        assert!(matches!(
+                            unsafe { node_ref.desc.load(Ordering::Relaxed, &guard).deref() },
+                            Descriptor::Remove(_)
+                        ));
                         decrease_removed_node(node.as_raw(), line!(), &guard);
                         unsafe { guard.defer_destroy(node) };
                         unsafe {
@@ -109,11 +115,13 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
 
     pub fn pop_back(&self) -> Option<RefCounted<V>> {
         let guard = pin();
+        let mut node_history = Vec::with_capacity(10);
         loop {
             let node = self.tail.prev.load(Ordering::Acquire, &guard);
             if ptr::eq(node.as_raw(), self.head.as_ref()) {
                 return None;
             }
+            node_history.push(node);
             let node_ref = unsafe { node.deref() };
             let old_desc = node_ref.desc.load(Ordering::Acquire, &guard);
             let old_desc_ref = unsafe { old_desc.deref() };
@@ -122,7 +130,9 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     op.link_prev.run_op(self, node_ref, &Backoff::new(), &guard);
                 }
                 Descriptor::Detach(op) => {
+                    assert!(self.skiplist.get(node_ref.key.as_ref().unwrap().deref()).is_some());
                     op.run_op(self, node_ref, &Backoff::new(), &guard);
+                    assert!(op.is_finished(&guard));
                 }
                 Descriptor::Insert(op) => {
                     op.run_op(self, node_ref, &Backoff::new(), &guard);
@@ -144,7 +154,14 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                                 entry.value().load(Ordering::Relaxed, &guard).as_raw(),
                                 node_ref,
                             ) {
+                                atomic::fence(Ordering::Release);
                                 entry.remove();
+                                assert!(matches!(
+                                    unsafe {
+                                        node_ref.desc.load(Ordering::Relaxed, &guard).deref()
+                                    },
+                                    Descriptor::Remove(_)
+                                ));
                             }
                         }
 
@@ -175,17 +192,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
 
         'outer: loop {
             let key = new_node_ref.key.as_ref().unwrap().clone();
-            let entry = self
-                .skiplist
-                .compare_insert(key, Atomic::from(new_node), |value| {
-                    let node = value.load(Ordering::Relaxed, &guard);
-                    let node_ref = unsafe { node.deref() };
-                    let desc_ref = unsafe { node_ref.desc.load(Ordering::Relaxed, &guard).deref() };
-                    if let Descriptor::Remove(_) = desc_ref {
-                        return true;
-                    }
-                    false
-                });
+            let entry = self.skiplist.get_or_insert(key, Atomic::from(new_node));
             let mut node = entry.value().load(Ordering::Acquire, &guard);
 
             let old_value = if ptr::eq(node.as_raw(), new_node_ref) {
@@ -223,10 +230,17 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         // The node was removed, try to allocate a new node
                         Descriptor::Remove(op) => {
                             op.link_prev.run_op(self, node_ref, &backoff, &guard);
+                            atomic::fence(Ordering::Release);
+                            entry.remove();
+                            assert!(matches!(
+                                unsafe { node_ref.desc.load(Ordering::Relaxed, &guard).deref() },
+                                Descriptor::Remove(_)
+                            ));
                             continue 'outer;
                         }
                         Descriptor::Detach(op) => {
                             op.run_op(self, node_ref, &backoff, &guard);
+                            assert!(op.is_finished(&guard));
                             node = op.get_new_node(&guard);
                             assert!(!node.is_null());
                             continue 'desc_select;
@@ -241,6 +255,9 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     };
 
                     old_desc_ref.run_op(self, node_ref, &backoff, &guard);
+                    assert!(
+                        matches!(old_desc_ref, Descriptor::Insert(op) if LruOperation::<K,V>::is_finished(op, &guard))
+                    );
 
                     if node_ref
                         .desc
@@ -257,6 +274,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         unsafe {
                             guard.defer_destroy(old_desc);
                         }
+                        assert!(matches!(unsafe { new_desc.deref() }, Descriptor::Detach(_)));
                         break (new_desc, old_value);
                     }
                     drop(unsafe { new_desc.into_owned() });
@@ -288,12 +306,12 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
             let node_ref = unsafe { node.deref() };
             let old_desc = node_ref.desc.load(Ordering::Relaxed, &guard);
             let old_desc_ref = unsafe { old_desc.deref() };
-            let last_op = &old_desc_ref;
-            match last_op {
+            match old_desc_ref {
                 Descriptor::Remove(_) => return None,
                 Descriptor::Detach(op) => {
                     atomic::fence(Ordering::Acquire);
                     op.run_op(self, node_ref, &backoff, &guard);
+                    assert!(op.is_finished(&guard));
                     node = op.get_new_node(&guard);
                     continue;
                 }
@@ -938,52 +956,37 @@ mod op {
         ) -> bool {
             if !LruOperation::<K, V>::is_finished(self, guard) {
                 let key = node.key.as_ref().unwrap().clone();
-                let value = self.remove.value.clone();
-                let Some(entry) = lru_cache.skiplist.get(&key) else {
+                let Some(entry) = lru_cache.skiplist.get(key.deref()) else {
                     // This op was finished by another thread and the entry was deleted later.
                     assert!(LruOperation::<K, V>::is_finished(self, guard));
                     return false;
                 };
-                let new_node = Node::new(key.clone(), value, lru_cache, guard);
-                increase_removed_node(new_node.as_raw(), line!(), guard);
-
                 let node_entry = entry.value();
                 let cur_node = node_entry.load(Ordering::Relaxed, guard);
-                if cur_node.tag() != 0 {
-                    // This op was finished by another thread and the entry was deleted later.
-                    assert!(LruOperation::<K, V>::is_finished(self, guard));
-                    return false;
-                }
-                let failed = if !ptr::eq(cur_node.as_raw(), node) {
-                    Some(cur_node)
+                let result = if !ptr::eq(cur_node.as_raw(), node) {
+                    cur_node
                 } else {
-                    None
-                };
-                let failed = failed.or_else(|| {
-                    assert!(ptr::eq(cur_node.as_raw(), node));
+                    let value = self.remove.value.clone();
+                    let new_node = Node::new(key.clone(), value, lru_cache, guard);
+                    increase_removed_node(new_node.as_raw(), line!(), guard);
+
                     if let Err(err) = node_entry.compare_exchange(
                         cur_node,
                         new_node,
-                        Ordering::Release,
-                        Ordering::Relaxed,
+                        Ordering::SeqCst,
+                        Ordering::Acquire,
                         guard,
                     ) {
-                        assert_ne!(new_node.as_raw(), err.current.as_raw());
-                        Some(err.current)
+                        unsafe {
+                            decrease_removed_node(new_node.as_raw(), line!(), &guard);
+                            drop(new_node.into_owned());
+                        }
+                        err.current
                     } else {
                         decrease_removed_node(ptr::from_ref(node), line!(), &guard);
                         unsafe { guard.defer_destroy(Shared::from(ptr::from_ref(node))) };
-                        None
+                        new_node
                     }
-                });
-                let result = if let Some(winner) = failed {
-                    unsafe {
-                        decrease_removed_node(new_node.as_raw(), line!(), &guard);
-                        drop(new_node.into_owned());
-                    }
-                    winner
-                } else {
-                    new_node
                 };
 
                 let new_desc =
@@ -999,27 +1002,29 @@ mod op {
         }
 
         fn store_result(&self, result: Self::Result, guard: &'a Guard) -> bool {
-            let old_node = self.new_node.load(Ordering::Relaxed, guard);
-            if old_node.tag() == 0 {
-                if self
-                    .new_node
-                    .compare_exchange(
-                        old_node,
-                        result.with_tag(1),
-                        Ordering::Release,
-                        Ordering::Acquire,
-                        guard,
-                    )
-                    .is_ok()
-                {
-                    return true;
-                }
+            assert!(result.is_null() == false);
+            if !self.new_node.load(Ordering::Relaxed, guard).is_null() {
+                atomic::fence(Ordering::Acquire);
+                return false;
+            }
+            if self
+                .new_node
+                .compare_exchange(
+                    Shared::null(),
+                    result.with_tag(0),
+                    Ordering::Release,
+                    Ordering::Acquire,
+                    guard,
+                )
+                .is_ok()
+            {
+                return true;
             }
             false
         }
 
         fn is_finished(&self, guard: &Guard) -> bool {
-            self.new_node.load(Ordering::Acquire, guard).tag() != 0
+            self.new_node.load(Ordering::Acquire, guard).is_null() == false
         }
     }
 
