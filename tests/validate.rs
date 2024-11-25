@@ -8,7 +8,7 @@ fn test_no_eviction() {
     std::thread::scope(|s| {
         for _ in 0..8 {
             s.spawn(|| {
-                for i in 0..1000000 {
+                for i in 0..10000000 {
                     cache.put(i % 10 + 1, i);
                 }
             });
@@ -26,7 +26,7 @@ fn test_eviction() {
     std::thread::scope(|s| {
         for _ in 0..8 {
             s.spawn(|| {
-                for i in 0..1000000 {
+                for i in 0..10000000 {
                     cache.put(i % 200 + 1, i);
                 }
             });
@@ -42,13 +42,13 @@ fn test_put_and_remove() {
         for i in 0..8 {
             if i % 2 == 0 {
                 s.spawn(|| {
-                    for i in 0..1000000 {
+                    for i in 0..10000000 {
                         cache.put(i % 200 + 1, i);
                     }
                 });
             } else {
                 s.spawn(|| {
-                    for i in 0..1000000 {
+                    for i in 0..10000000 {
                         cache.remove(&(i % 200 + 1));
                     }
                 });

@@ -12,6 +12,13 @@ crossbeam-skiplist = "*"
 smallvec = { version = "1.13.2", features = ["const_generics"] }
 thread_local = "1.1.8"
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "benchmark"
+harness = false
+
 [profile.release]
 debug = "full"
 split-debuginfo = "packed"

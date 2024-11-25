@@ -58,21 +58,21 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
 
         let guard = pin();
         let mut node = entry.value().load(Ordering::Acquire, &guard);
-        let backoff = Backoff::new();
         loop {
             let node_ref = unsafe { node.deref() };
             let old_desc = node_ref.desc.load(Ordering::Acquire, &guard);
             let old_desc_ref = unsafe { old_desc.deref() };
             match &old_desc_ref {
                 Descriptor::Remove(op) => {
-                    op.link_prev.run_op(self, node_ref, &backoff, &guard);
+                    op.link_prev.run_op(self, node_ref, &Backoff::new(), &guard);
                     return None;
                 }
                 Descriptor::Detach(op) => {
-                    op.run_op(self, node_ref, &backoff, &guard);
+                    op.run_op(self, node_ref, &Backoff::new(), &guard);
                     node = op.get_new_node(&guard);
                 }
                 Descriptor::Insert(op) => {
+                    let backoff = Backoff::new();
                     op.run_op(self, node_ref, &backoff, &guard);
                     let value = op.clone_value(&guard);
                     let desc = Owned::new(Descriptor::Remove(op::Remove::new(value.clone())));
@@ -84,7 +84,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                         &guard,
                     ) {
                         self.size.fetch_sub(1, Ordering::Relaxed);
-                        unsafe { new.deref() }.run_op(self, node_ref, &backoff, &guard);
+                        unsafe { new.deref() }.run_op(self, node_ref, &Backoff::new(), &guard);
                         entry.remove();
                         unsafe { guard.defer_destroy(node) };
                         unsafe {
@@ -1017,6 +1017,7 @@ mod op {
         V: Send + Sync + 'a,
     {
         type Result = &'a RefCounted<V>;
+
         fn run_op(
             &self,
             lru_cache: &Lru<K, V>,
