@@ -3,10 +3,7 @@ use std::{
     ops::Deref,
     process::abort,
     ptr::{self},
-    sync::{
-        atomic::{self, AtomicUsize, Ordering},
-        LazyLock,
-    },
+    sync::atomic::{self, AtomicUsize, Ordering},
     usize,
 };
 
@@ -18,9 +15,6 @@ use crossbeam_skiplist::SkipMap;
 use op::LruOperation;
 
 use crate::atomic_ref_count::{AtomicRefCounted, RefCounted};
-
-static REMOVED_NODES: LazyLock<SkipMap<usize, Atomic<(usize, u64)>>> =
-    LazyLock::new(|| SkipMap::new());
 
 pub struct Lru<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> {
     skiplist: SkipMap<RefCounted<K>, Atomic<Node<K, V>>>,
@@ -65,7 +59,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
         };
 
         let guard = pin();
-        let mut node = entry.value().load(Ordering::Relaxed, &guard);
+        let mut node = entry.value().load(Ordering::Acquire, &guard);
         let backoff = Backoff::new();
         loop {
             let node_ref = unsafe { node.deref() };
@@ -94,13 +88,11 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     ) {
                         self.size.fetch_sub(1, Ordering::Relaxed);
                         unsafe { new.deref() }.run_op(self, node_ref, &backoff, &guard);
-                        atomic::fence(Ordering::Release);
                         entry.remove();
                         assert!(matches!(
                             unsafe { node_ref.desc.load(Ordering::Relaxed, &guard).deref() },
                             Descriptor::Remove(_)
                         ));
-                        decrease_removed_node(node.as_raw(), line!(), &guard);
                         unsafe { guard.defer_destroy(node) };
                         unsafe {
                             guard.defer_destroy(old_desc);
@@ -115,13 +107,11 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
 
     pub fn pop_back(&self) -> Option<RefCounted<V>> {
         let guard = pin();
-        let mut node_history = Vec::with_capacity(10);
         loop {
             let node = self.tail.prev.load(Ordering::Acquire, &guard);
             if ptr::eq(node.as_raw(), self.head.as_ref()) {
                 return None;
             }
-            node_history.push(node);
             let node_ref = unsafe { node.deref() };
             let old_desc = node_ref.desc.load(Ordering::Acquire, &guard);
             let old_desc_ref = unsafe { old_desc.deref() };
@@ -130,7 +120,6 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     op.link_prev.run_op(self, node_ref, &Backoff::new(), &guard);
                 }
                 Descriptor::Detach(op) => {
-                    assert!(self.skiplist.get(node_ref.key.as_ref().unwrap().deref()).is_some());
                     op.run_op(self, node_ref, &Backoff::new(), &guard);
                     assert!(op.is_finished(&guard));
                 }
@@ -154,7 +143,6 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                                 entry.value().load(Ordering::Relaxed, &guard).as_raw(),
                                 node_ref,
                             ) {
-                                atomic::fence(Ordering::Release);
                                 entry.remove();
                                 assert!(matches!(
                                     unsafe {
@@ -165,7 +153,6 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                             }
                         }
 
-                        decrease_removed_node(node.as_raw(), line!(), &guard);
                         unsafe { guard.defer_destroy(node) };
                         unsafe {
                             guard.defer_destroy(old_desc);
@@ -184,7 +171,6 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
     ) -> Option<RefCounted<V>> {
         let guard = pin();
         let new_node = Node::new(key, value, self, &guard);
-        increase_removed_node(new_node.as_raw(), line!(), &guard);
         let new_node_ref = unsafe { new_node.deref() };
         let desc = new_node_ref.desc.load(Ordering::Relaxed, &guard);
         let desc_ref = unsafe { desc.deref() };
@@ -216,7 +202,7 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                 // If the capacity is reached, remove LRU node.
                 if len >= self.cap.get() {
                     atomic::fence(Ordering::Acquire);
-                    assert!(self.pop_back().is_some());
+                    self.pop_back();
                 }
                 None
             } else {
@@ -281,7 +267,6 @@ impl<K: Ord + Send + Sync + 'static, V: Send + Sync + 'static> Lru<K, V> {
                     backoff.spin();
                 };
 
-                decrease_removed_node(new_node.as_raw(), line!(), &guard);
                 unsafe { guard.defer_destroy(new_node) };
 
                 let cur_desc_ref = unsafe { cur_desc.deref() };
@@ -722,40 +707,6 @@ where
     }
 }
 
-fn decrease_removed_node<K, V>(addr: *const Node<K, V>, linenu: u32, guard: &Guard)
-where
-    K: Send + Sync,
-    V: Send + Sync,
-{
-    let entry = REMOVED_NODES.get(&(addr as usize)).unwrap();
-    let v = entry.value();
-    let old = v.load(Ordering::SeqCst, guard);
-    let (count, line) = unsafe { old.as_ref().unwrap() };
-    assert_eq!(*count, 1);
-    let new = Owned::new((count - 1, line << 32 | linenu as u64)).into_shared(guard);
-    if let Err(err) = v.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst, guard) {
-        let cur = unsafe { err.current.deref() };
-        panic!("{cur:?}");
-    }
-}
-fn increase_removed_node<K, V>(addr: *const Node<K, V>, linenu: u32, guard: &Guard)
-where
-    K: Send + Sync,
-    V: Send + Sync,
-{
-    let entry = REMOVED_NODES.get_or_insert(addr as usize, Atomic::null());
-    let v = entry.value();
-    let old = v.load(Ordering::SeqCst, guard);
-    let new = if let Some((count, line)) = unsafe { old.as_ref() } {
-        assert_eq!(*count, 0);
-        Owned::new((1, line << 32 | linenu as u64)).into_shared(guard)
-    } else {
-        Owned::new((1, linenu as u64)).into_shared(guard)
-    };
-    v.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst, guard)
-        .ok();
-}
-
 mod op {
     use atomic::AtomicBool;
 
@@ -924,7 +875,7 @@ mod op {
 
     impl<K, V> Detach<K, V>
     where
-        K: Send + Sync,
+        K: Send + Sync + Ord,
         V: Send + Sync,
     {
         #[inline]
@@ -938,6 +889,30 @@ mod op {
         pub fn get_new_node<'a>(&self, guard: &'a Guard) -> Shared<'a, Node<K, V>> {
             self.new_node.load(Ordering::Acquire, guard).with_tag(0)
         }
+
+        fn create_new_node<'a>(
+            &self,
+            lru_cache: &Lru<K, V>,
+            node: &Node<K, V>,
+            guard: &'a Guard,
+        ) -> Shared<'a, Node<K, V>> {
+            let new_node = self.new_node.load(Ordering::Relaxed, guard);
+            if !new_node.is_null() {
+                atomic::fence(Ordering::Acquire);
+                return new_node;
+            }
+            let key = node.key.as_ref().unwrap().clone();
+            let value = self.remove.value.clone();
+            let new_node = Node::new(key, value, lru_cache, guard);
+            if LruOperation::<K, V>::store_result(self, new_node, guard) {
+                new_node
+            } else {
+                unsafe {
+                    drop(new_node.into_owned());
+                }
+                self.new_node.load(Ordering::Relaxed, guard)
+            }
+        }
     }
 
     impl<'a, K, V> LruOperation<'a, K, V> for Detach<K, V>
@@ -947,6 +922,7 @@ mod op {
     {
         type Result = Shared<'a, Node<K, V>>;
 
+        #[inline]
         fn run_op(
             &self,
             lru_cache: &Lru<K, V>,
@@ -954,61 +930,45 @@ mod op {
             backoff: &Backoff,
             guard: &Guard,
         ) -> bool {
-            if !LruOperation::<K, V>::is_finished(self, guard) {
-                let key = node.key.as_ref().unwrap().clone();
-                let Some(entry) = lru_cache.skiplist.get(key.deref()) else {
-                    // This op was finished by another thread and the entry was deleted later.
-                    assert!(LruOperation::<K, V>::is_finished(self, guard));
-                    return false;
-                };
+            if LruOperation::<K, V>::is_finished(self, guard) {
+                return false;
+            }
+
+            let new_node = self.create_new_node(lru_cache, node, guard);
+            let key = node.key.as_ref().unwrap().deref();
+            if let Some(entry) = lru_cache.skiplist.get(key) {
                 let node_entry = entry.value();
                 let cur_node = node_entry.load(Ordering::Relaxed, guard);
-                let result = if !ptr::eq(cur_node.as_raw(), node) {
-                    cur_node
-                } else {
-                    let value = self.remove.value.clone();
-                    let new_node = Node::new(key.clone(), value, lru_cache, guard);
-                    increase_removed_node(new_node.as_raw(), line!(), guard);
-
-                    if let Err(err) = node_entry.compare_exchange(
+                if !ptr::eq(cur_node.as_raw(), node) {
+                    atomic::fence(Ordering::Acquire);
+                } else if node_entry
+                    .compare_exchange(
                         cur_node,
                         new_node,
                         Ordering::SeqCst,
                         Ordering::Acquire,
                         guard,
-                    ) {
-                        unsafe {
-                            decrease_removed_node(new_node.as_raw(), line!(), &guard);
-                            drop(new_node.into_owned());
-                        }
-                        err.current
-                    } else {
-                        decrease_removed_node(ptr::from_ref(node), line!(), &guard);
-                        unsafe { guard.defer_destroy(Shared::from(ptr::from_ref(node))) };
-                        new_node
-                    }
-                };
+                    )
+                    .is_ok()
+                {
+                    unsafe { guard.defer_destroy(Shared::from(ptr::from_ref(node))) };
+                }
 
                 let new_desc =
-                    unsafe { result.deref().desc.load(Ordering::Relaxed, guard).deref() };
+                    unsafe { new_node.deref().desc.load(Ordering::Relaxed, guard).deref() };
                 if let Descriptor::Insert(new_op) = new_desc {
                     new_op
                         .attach
-                        .run_op(lru_cache, unsafe { result.deref() }, backoff, guard);
+                        .run_op(lru_cache, unsafe { new_node.deref() }, backoff, guard);
                 };
-                LruOperation::<K, V>::store_result(self, result, guard);
-            }
+            };
+
             return LruOperation::<K, V>::run_op(&self.remove, lru_cache, node, backoff, guard);
         }
 
         fn store_result(&self, result: Self::Result, guard: &'a Guard) -> bool {
             assert!(result.is_null() == false);
-            if !self.new_node.load(Ordering::Relaxed, guard).is_null() {
-                atomic::fence(Ordering::Acquire);
-                return false;
-            }
-            if self
-                .new_node
+            self.new_node
                 .compare_exchange(
                     Shared::null(),
                     result.with_tag(0),
@@ -1017,14 +977,10 @@ mod op {
                     guard,
                 )
                 .is_ok()
-            {
-                return true;
-            }
-            false
         }
 
         fn is_finished(&self, guard: &Guard) -> bool {
-            self.new_node.load(Ordering::Acquire, guard).is_null() == false
+            LruOperation::<K, V>::is_finished(&self.remove, guard)
         }
     }
 
