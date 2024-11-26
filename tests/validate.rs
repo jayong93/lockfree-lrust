@@ -6,7 +6,7 @@ use lockfree_car::lru::Lru;
 fn test_no_eviction() {
     let cache: Lru<usize, usize> = Lru::new(NonZeroUsize::new(100).unwrap());
     std::thread::scope(|s| {
-        for _ in 0..8 {
+        for _ in 0..32 {
             s.spawn(|| {
                 for i in 0..10000000 {
                     cache.put(i % 10 + 1, i);
@@ -24,7 +24,7 @@ fn test_no_eviction() {
 fn test_eviction() {
     let cache: Lru<usize, usize> = Lru::new(NonZeroUsize::new(100).unwrap());
     std::thread::scope(|s| {
-        for _ in 0..8 {
+        for _ in 0..32 {
             s.spawn(|| {
                 for i in 0..10000000 {
                     cache.put(i % 200 + 1, i);
@@ -39,7 +39,7 @@ fn test_eviction() {
 fn test_put_and_remove() {
     let cache: Lru<usize, usize> = Lru::new(NonZeroUsize::new(100).unwrap());
     std::thread::scope(|s| {
-        for i in 0..8 {
+        for i in 0..32 {
             if i % 2 == 0 {
                 s.spawn(|| {
                     for i in 0..10000000 {

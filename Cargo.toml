@@ -9,6 +9,7 @@ name = "lockfree_car"
 [dependencies]
 crossbeam = {version="0.8.4", default-features=false, features=["crossbeam-queue", "crossbeam-epoch", "alloc"]}
 crossbeam-skiplist = "*"
+seize = "0.4.5"
 smallvec = { version = "1.13.2", features = ["const_generics"] }
 thread_local = "1.1.8"
 

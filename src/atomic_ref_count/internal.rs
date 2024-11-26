@@ -7,37 +7,31 @@ use std::{
     sync::atomic::{self, AtomicUsize, Ordering},
 };
 
-use crossbeam::epoch::{pin, Atomic, Guard, Owned, Shared};
+use seize::{Collector, Guard, Linked, LocalGuard};
 
-const MAX_REF_COUNT: usize = usize::MAX >> 10;
+use crate::reclaim::{cast_from_linked, cast_to_linked, Atomic, Shared};
+
+const MAX_REF_COUNT: usize = usize::MAX >> 1;
 
 #[repr(transparent)]
 #[derive(Debug)]
-pub struct RefCounted<T: Send + Sync> {
-    inner: NonNull<RefCountedInner<T>>,
-}
-
-impl<T: Send + Sync> From<T> for RefCounted<T> {
-    fn from(value: T) -> Self {
-        Self::new(value)
-    }
+pub(crate) struct RefCounted<T> {
+    inner: NonNull<Linked<RefCountedInner<T>>>,
 }
 
 impl<T: Send + Sync> Clone for RefCounted<T> {
     fn clone(&self) -> Self {
         let inner = unsafe { self.inner.as_ref() };
-        inner.try_increment();
+        assert!(inner.try_increment());
         Self {
             inner: unsafe { NonNull::new_unchecked(ptr::from_ref(inner).cast_mut()) },
         }
     }
 }
 
-impl<T: Send + Sync> Drop for RefCounted<T> {
+impl<T> Drop for RefCounted<T> {
     fn drop(&mut self) {
-        unsafe {
-            self.inner.as_ref().decrement();
-        }
+        RefCountedInner::decrement(self.inner.as_ptr());
     }
 }
 
@@ -46,13 +40,9 @@ unsafe impl<T: Send + Sync> Sync for RefCounted<T> {}
 
 impl<T: Send + Sync> RefCounted<T> {
     #[inline]
-    pub fn new(data: T) -> Self {
+    pub fn new(data: T, collector: &Collector) -> Self {
         Self {
-            inner: unsafe {
-                NonNull::new_unchecked(Box::into_raw(
-                    Owned::new(RefCountedInner::new(data)).into_box(),
-                ))
-            },
+            inner: unsafe { NonNull::new_unchecked(RefCountedInner::new(data, collector)) },
         }
     }
 
@@ -67,27 +57,23 @@ impl<T: Send + Sync> RefCounted<T> {
             return None;
         }
         atomic::fence(Ordering::Acquire);
-        let guard = pin();
 
         let inner = unsafe { ptr::read(inner_ptr) };
-        unsafe {
-            guard.defer_destroy(Shared::from(
-                inner_ptr
-                    .cast_const()
-                    .cast::<ManuallyDrop<RefCountedInner<T>>>(),
-            ));
-        }
-        Some(inner.data)
+        Some(inner.value.data)
     }
 
     #[inline]
     pub fn into_raw(self) -> NonNull<T> {
-        self.into_inner_raw().cast()
+        unsafe {
+            NonNull::new_unchecked(cast_from_linked(self.into_inner_raw().as_ptr()).cast::<T>())
+        }
     }
 
     #[inline]
     pub unsafe fn from_raw(this: NonNull<T>) -> Self {
-        Self { inner: this.cast() }
+        Self::from_inner_raw(unsafe {
+            NonNull::new_unchecked(cast_to_linked(this.cast::<RefCountedInner<T>>().as_ptr()))
+        })
     }
 
     #[inline]
@@ -96,14 +82,14 @@ impl<T: Send + Sync> RefCounted<T> {
     }
 
     #[inline]
-    fn into_inner_raw(self) -> NonNull<RefCountedInner<T>> {
+    fn into_inner_raw(self) -> NonNull<Linked<RefCountedInner<T>>> {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr
     }
 
     #[inline]
-    unsafe fn from_inner_raw(this: NonNull<RefCountedInner<T>>) -> Self {
+    unsafe fn from_inner_raw(this: NonNull<Linked<RefCountedInner<T>>>) -> Self {
         Self { inner: this }
     }
 }
@@ -144,20 +130,16 @@ impl<T: Send + Sync + Ord> Ord for RefCounted<T> {
 
 #[repr(transparent)]
 #[derive(Debug)]
-pub struct AtomicRefCounted<T: Send + Sync> {
+pub(crate) struct AtomicRefCounted<T> {
     inner: Atomic<RefCountedInner<T>>,
 }
 
-impl<T: Send + Sync> Drop for AtomicRefCounted<T> {
+impl<T> Drop for AtomicRefCounted<T> {
     fn drop(&mut self) {
-        let fake_guard = unsafe { crossbeam::epoch::unprotected() };
-        if let Some(inner) = unsafe {
-            self.inner
-                .swap(Shared::null().with_tag(1), Ordering::Relaxed, fake_guard)
-                .as_ref()
-        } {
-            atomic::fence(Ordering::Acquire);
-            inner.decrement();
+        let fake_guard = unsafe { seize::unprotected() };
+        let inner = self.inner.load(Ordering::SeqCst, &fake_guard);
+        if let Some(inner) = unsafe { inner.as_ref() } {
+            RefCountedInner::decrement(ptr::from_ref(inner).cast_mut())
         }
     }
 }
@@ -169,7 +151,7 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     #[inline]
     pub fn new(data: RefCounted<T>) -> Self {
         Self {
-            inner: Atomic::from(data.into_inner_raw().as_ptr().cast_const().cast()),
+            inner: Shared::from(data.into_inner_raw().as_ptr()).into(),
         }
     }
 
@@ -180,19 +162,17 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
         }
     }
 
-    /// This keeps trying to clone `RefCounted` until success. Because
     #[inline]
-    pub fn load<'a>(&self, order: Ordering, guard: &'a Guard) -> Option<&'a T> {
-        let inner = self.inner.load(order, guard);
-        if let Some(inner) = unsafe { inner.as_ref() } {
-            Some(&inner.data)
-        } else {
-            None
-        }
+    pub fn load<'a>(&self, order: Ordering, guard: &'a LocalGuard) -> Shared<'a, T> {
+        self.inner
+            .load(order, guard)
+            .as_ptr()
+            .cast::<Linked<T>>()
+            .into()
     }
 
     #[inline]
-    pub fn clone_inner(&self, order: Ordering, guard: &Guard) -> Option<RefCounted<T>> {
+    pub fn clone_inner(&self, order: Ordering, guard: &LocalGuard) -> Option<RefCounted<T>> {
         loop {
             if let Ok(cloned) = self.try_clone_inner(order, guard) {
                 break cloned;
@@ -204,7 +184,7 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     pub fn try_clone_inner(
         &self,
         order: Ordering,
-        guard: &Guard,
+        guard: &LocalGuard,
     ) -> Result<Option<RefCounted<T>>, ()> {
         let inner = self.inner.load(order, guard);
         if let Some(inner) = unsafe { inner.as_ref() } {
@@ -219,55 +199,57 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     }
 
     #[inline]
-    pub fn compare_exchange_common<'a, F>(
+    fn compare_exchange_common<'a, F, G>(
         &self,
-        current: Option<&T>,
+        expected: Option<&T>,
         new: Option<RefCounted<T>>,
         success: Ordering,
         failure: Ordering,
         func: F,
-        guard: &'a Guard,
-    ) -> Result<CompareExchangeOk<T>, CompareExchangeErr<'a, T>>
+        guard: &'a G,
+    ) -> Result<Option<RefCounted<T>>, CompareExchangeErr<T>>
     where
-        T: 'a,
+        G: Guard,
         F: FnOnce(
             &Atomic<RefCountedInner<T>>,
             Shared<'a, RefCountedInner<T>>,
             Shared<'a, RefCountedInner<T>>,
             Ordering,
             Ordering,
-            &'a Guard,
+            &'a G,
         ) -> Result<
             Shared<'a, RefCountedInner<T>>,
-            crossbeam::epoch::CompareExchangeError<
-                'a,
-                RefCountedInner<T>,
-                Shared<'a, RefCountedInner<T>>,
-            >,
+            crate::reclaim::CompareExchangeError<'a, RefCountedInner<T>>,
         >,
     {
-        let current = if let Some(current) = current {
-            Shared::from(ptr::from_ref(current).cast::<RefCountedInner<T>>())
+        let expected = if let Some(current) = expected {
+            Shared::from(cast_to_linked(
+                ptr::from_ref(current)
+                    .cast::<RefCountedInner<T>>()
+                    .cast_mut(),
+            ))
         } else {
             Shared::null()
         };
         let new_ptr = if let Some(new) = &new {
-            Shared::from(new.inner.as_ptr().cast_const())
+            Shared::from(new.inner.as_ptr())
         } else {
             Shared::null()
         };
-        match func(&self.inner, current, new_ptr, success, failure, guard) {
-            Ok(_) => Ok({
-                std::mem::forget(new);
-                CompareExchangeOk {
-                    old: unsafe { current.as_ref() }.map(|v| {
+        match func(&self.inner, expected, new_ptr, success, failure, guard) {
+            Ok(old) => {
+                Ok({
+                    std::mem::forget(new);
+                    // SAFETY: In `AtomicRefCounted`, `expected` is always aligned so `old`
+                    // pointer must be also aligned.
+                    unsafe { old.as_ref() }.map(|v| {
                         // SAFETY: Only we can get the old `RefCountedInner` pointer created by
                         // `RefCounted::into_inner_raw`.
                         unsafe { RefCounted::from_inner_raw(v.into()) }
-                    }),
-                }
-            }),
-            // The `old` pointer might be queued for deallocation if another thread already took it
+                    })
+                })
+            }
+            // The `err.current` might be queued for deallocation if another thread already took it
             // from `self` by another compare-exchange call. But we have `Guard` here we can assume
             // the pointer is valid until the `Guard` is dropped.
             Err(err) => Err(CompareExchangeErr {
@@ -278,9 +260,9 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
                                 inner.into(),
                             ))
                         } else {
-                            CompareExchangeErrCuurentValue::Removed(Shared::from(
-                                ptr::from_ref(inner).cast::<T>(),
-                            ))
+                            CompareExchangeErrCuurentValue::Removed(
+                                cast_from_linked(ptr::from_ref(inner).cast_mut()).cast(),
+                            )
                         }
                     })
                 },
@@ -290,77 +272,62 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     }
 
     #[inline]
-    pub fn compare_exchange_weak<'a>(
+    pub fn compare_exchange_weak(
         &self,
         current: Option<&T>,
         new: Option<RefCounted<T>>,
         success: Ordering,
         failure: Ordering,
-        guard: &'a Guard,
-    ) -> Result<CompareExchangeOk<T>, CompareExchangeErr<'a, T>> {
+        guard: &LocalGuard,
+    ) -> Result<Option<RefCounted<T>>, CompareExchangeErr<T>> {
         self.compare_exchange_common(
             current,
             new,
             success,
             failure,
-            Atomic::compare_exchange_weak::<Shared<_>>,
+            Atomic::compare_exchange_weak,
             guard,
         )
     }
 
     #[inline]
-    pub fn compare_exchange<'a>(
+    pub fn compare_exchange(
         &self,
         current: Option<&T>,
         new: Option<RefCounted<T>>,
         success: Ordering,
         failure: Ordering,
-        guard: &'a Guard,
-    ) -> Result<CompareExchangeOk<T>, CompareExchangeErr<'a, T>> {
+        guard: &LocalGuard,
+    ) -> Result<Option<RefCounted<T>>, CompareExchangeErr<T>> {
         self.compare_exchange_common(
             current,
             new,
             success,
             failure,
-            Atomic::compare_exchange::<Shared<_>>,
+            Atomic::compare_exchange,
             guard,
         )
     }
 
     #[inline]
-    pub fn make_constant(
-        &self,
-        expected: Option<&T>,
-        success: Ordering,
-        failure: Ordering,
-        guard: &Guard,
-    ) -> bool {
-        let value = if let Some(value) = expected {
-            Shared::from(ptr::from_ref(value).cast::<RefCountedInner<T>>())
-        } else {
-            Shared::null()
-        };
-
-        let cur_value = self.inner.load(Ordering::Relaxed, guard);
-        if !ptr::eq(cur_value.as_raw(), value.as_raw()) {
-            return false;
+    pub fn make_constant(&self, success: Ordering, failure: Ordering, guard: &LocalGuard) -> bool {
+        loop {
+            let old_ptr = self.inner.load(failure, guard);
+            if old_ptr.tag() != 0 {
+                return false;
+            }
+            if self
+                .inner
+                .compare_exchange_weak(old_ptr, old_ptr.with_tag(1), success, failure, guard)
+                .is_ok()
+            {
+                return true;
+            }
         }
-        if cur_value.tag() != 0 {
-            return false;
-        }
-
-        if self
-            .inner
-            .compare_exchange(value, value.with_tag(1), success, failure, guard)
-            .is_ok()
-        {
-            return true;
-        }
-        false
     }
 
     #[inline]
-    pub fn is_constant(&self, guard: &Guard) -> bool {
+    pub fn is_constant(&self, guard: &LocalGuard) -> bool {
         self.inner.load(Ordering::Relaxed, guard).tag() != 0
     }
 }
@@ -368,28 +335,30 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
 pub struct CompareExchangeOk<T: Send + Sync> {
     pub old: Option<RefCounted<T>>,
 }
-pub enum CompareExchangeErrCuurentValue<'a, T: Send + Sync> {
-    Removed(Shared<'a, T>),
+pub enum CompareExchangeErrCuurentValue<T: Send + Sync> {
+    Removed(*mut T),
     Cloned(RefCounted<T>),
 }
 
-pub struct CompareExchangeErr<'a, T: Send + Sync> {
-    pub current: Option<CompareExchangeErrCuurentValue<'a, T>>,
+pub struct CompareExchangeErr<T: Send + Sync> {
+    pub current: Option<CompareExchangeErrCuurentValue<T>>,
     pub new: Option<RefCounted<T>>,
 }
 
 #[repr(C)]
-struct RefCountedInner<T: Send + Sync> {
+struct RefCountedInner<T> {
     data: T,
     ref_count: AtomicUsize,
+    collector: NonNull<Collector>,
 }
 
-impl<T: Send + Sync> RefCountedInner<T> {
-    fn new(data: T) -> Self {
-        Self {
+impl<T> RefCountedInner<T> {
+    fn new(data: T, collector: &Collector) -> *mut Linked<Self> {
+        collector.link_boxed(Self {
             ref_count: AtomicUsize::new(1),
             data,
-        }
+            collector: collector.into(),
+        })
     }
 
     #[inline]
@@ -418,19 +387,13 @@ impl<T: Send + Sync> RefCountedInner<T> {
     }
 
     #[inline]
-    fn decrement(&self) {
-        if self.ref_count.fetch_sub(1, Ordering::Release) == 1 {
+    fn decrement(this: *mut Linked<Self>) {
+        if unsafe { &*this }.ref_count.fetch_sub(1, Ordering::Release) == 1 {
             atomic::fence(Ordering::Acquire);
-            let guard = pin();
             // This line should be called once because otherwise `Self::finalize` might be called
             // with `self` pointer which was already deallocated by another thread
-            let this = ptr::from_ref(self);
-            unsafe { guard.defer_unchecked(move || Self::finalize(this)) };
+            let collector = unsafe { (&*this).collector.as_ref() };
+            unsafe { collector.retire(this, seize::reclaim::boxed::<Linked<RefCountedInner<T>>>) };
         }
-    }
-
-    #[cold]
-    unsafe fn finalize(this: *const Self) {
-        drop(Owned::from_raw(this.cast_mut()))
     }
 }

@@ -266,6 +266,7 @@ dependencies = [
  "criterion",
  "crossbeam",
  "crossbeam-skiplist",
+ "seize",
  "smallvec",
  "thread_local",
 ]
@@ -412,6 +413,12 @@ checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
 ]
+
+[[package]]
+name = "seize"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d659fa6f19e82a52ab8d3fff3c380bd8cc16462eaea411395618a38760eb85bc"
 
 [[package]]
 name = "serde"
