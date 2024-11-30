@@ -1,7 +1,6 @@
-pub(crate) use seize::{Collector, Guard, Linked, LocalGuard};
+pub(crate) use seize::{Collector, Guard, Linked};
 
 use std::marker::PhantomData;
-use std::ops::Deref;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::{fmt, ptr};
 
@@ -35,55 +34,70 @@ impl<T> Atomic<T> {
         guard.protect(&self.0, ordering).into()
     }
 
-    pub(crate) fn store(&self, new: Shared<'_, T>, ordering: Ordering) {
-        self.0.store(new.ptr, ordering);
+    pub(crate) fn store<'a, P, G>(&self, new: P, ordering: Ordering)
+    where
+        P: Pointer<'a, T, G>,
+        G: Guard,
+    {
+        self.0.store(new.into().ptr, ordering);
     }
 
-    pub(crate) fn swap<'g>(
-        &self,
-        new: Shared<'_, T>,
-        ord: Ordering,
-        _: &'g impl Guard,
-    ) -> Shared<'g, T> {
-        self.0.swap(new.ptr, ord).into()
+    pub(crate) fn swap<'g, P, G>(&self, new: P, ord: Ordering, guard: &'g G) -> P
+    where
+        P: Pointer<'g, T, G>,
+        G: Guard,
+    {
+        unsafe { P::new_with_guard(self.0.swap(new.into().ptr, ord).into(), guard) }
     }
 
-    pub(crate) fn compare_exchange<'g>(
+    pub(crate) fn compare_exchange<'g, P, G>(
         &self,
-        current: Shared<'_, T>,
-        new: Shared<'g, T>,
+        current: Shared<'g, T>,
+        new: P,
         success: Ordering,
         failure: Ordering,
-        _: &'g impl Guard,
-    ) -> Result<Shared<'g, T>, CompareExchangeError<'g, T>> {
+        guard: &'g G,
+    ) -> Result<P, CompareExchangeError<'g, T, P, G>>
+    where
+        P: Pointer<'g, T, G>,
+        G: Guard,
+    {
+        let new: Shared<_> = new.into();
         match self
             .0
             .compare_exchange(current.ptr, new.ptr, success, failure)
         {
-            Ok(ptr) => Ok(ptr.into()),
+            Ok(ptr) => Ok(unsafe { P::new_with_guard(ptr.into(), guard) }),
             Err(current) => Err(CompareExchangeError {
                 current: current.into(),
-                new,
+                new: unsafe{P::new_with_guard(new, guard)},
+                _marker: Default::default(),
             }),
         }
     }
 
-    pub(crate) fn compare_exchange_weak<'g>(
+    pub(crate) fn compare_exchange_weak<'g, P, G>(
         &self,
         current: Shared<'_, T>,
-        new: Shared<'g, T>,
+        new: P,
         success: Ordering,
         failure: Ordering,
-        _: &'g impl Guard,
-    ) -> Result<Shared<'g, T>, CompareExchangeError<'g, T>> {
+        guard: &'g G,
+    ) -> Result<P, CompareExchangeError<'g, T, P, G>>
+    where
+        P: Pointer<'g, T, G>,
+        G: Guard,
+    {
+        let new: Shared<_> = new.into();
         match self
             .0
             .compare_exchange_weak(current.ptr, new.ptr, success, failure)
         {
-            Ok(ptr) => Ok(ptr.into()),
+            Ok(ptr) => Ok(unsafe{P::new_with_guard(ptr.into(), guard)}),
             Err(current) => Err(CompareExchangeError {
                 current: current.into(),
-                new,
+                new: unsafe{P::new_with_guard(new, guard)},
+                _marker: Default::default(),
             }),
         }
     }
@@ -113,9 +127,14 @@ impl<T> fmt::Debug for Atomic<T> {
     }
 }
 
-pub(crate) struct CompareExchangeError<'g, T> {
+pub(crate) struct CompareExchangeError<'g, T, P, G>
+where
+    P: Pointer<'g, T, G>,
+    G: Guard,
+{
     pub(crate) current: Shared<'g, T>,
-    pub(crate) new: Shared<'g, T>,
+    pub(crate) new: P,
+    _marker: PhantomData<G>,
 }
 
 #[repr(transparent)]
@@ -224,6 +243,21 @@ impl<T> From<*const Linked<T>> for Shared<'_, T> {
     }
 }
 
+impl<'g, T, G> Pointer<'g, T, G> for Shared<'g, T>
+where
+    G: Guard,
+{
+    #[inline]
+    unsafe fn new_with_guard(ptr: Shared<'g, T>, _: &'g G) -> Self {
+        ptr
+    }
+
+    #[inline]
+    fn as_shared(&self) -> Shared<'g, T> {
+        *self
+    }
+}
+
 pub(crate) trait RetireShared {
     unsafe fn retire_shared<T>(&self, shared: Shared<'_, T>);
 }
@@ -233,24 +267,16 @@ where
     G: Guard,
 {
     unsafe fn retire_shared<T>(&self, shared: Shared<'_, T>) {
-        self.defer_retire(shared.ptr, seize::reclaim::boxed::<Linked<T>>);
+        self.defer_retire(shared.as_ptr(), seize::reclaim::boxed::<Linked<T>>);
     }
 }
 
-pub(crate) enum GuardRef<'g> {
-    Owned(LocalGuard<'g>),
-    Ref(&'g LocalGuard<'g>),
-}
-
-impl<'g> Deref for GuardRef<'g> {
-    type Target = LocalGuard<'g>;
-
-    #[inline]
-    fn deref(&self) -> &LocalGuard<'g> {
-        match *self {
-            GuardRef::Owned(ref guard) | GuardRef::Ref(&ref guard) => guard,
-        }
-    }
+pub(crate) trait Pointer<'a, T, G>: Into<Shared<'a, T>>
+where
+    G: Guard,
+{
+    unsafe fn new_with_guard(ptr: Shared<'a, T>, guard: &'a G) -> Self;
+    fn as_shared(&self) -> Shared<'a, T>;
 }
 
 mod test {
@@ -265,6 +291,7 @@ mod test {
         assert_eq!(shared.with_tag(1).as_ptr(), original_ptr);
         assert_eq!(shared.with_tag(1).ptr, unsafe { original_ptr.byte_add(1) });
         assert_eq!(shared.with_tag(1).tag(), 1);
+        assert_eq!(shared.with_tag(1).with_tag(7).tag(), 7);
         assert_eq!(shared.with_tag(3).ptr, unsafe { original_ptr.byte_add(3) });
         assert_eq!(shared.with_tag(3).tag(), 3);
         assert_eq!(shared.with_tag(1).without_tag().ptr, original_ptr);
@@ -275,14 +302,13 @@ mod test {
         let collector = Collector::new();
         let ptr = collector.link_boxed(1234u16);
         let value_ptr = cast_from_linked(ptr);
-        assert_eq!(unsafe{*value_ptr}, 1234);
+        assert_eq!(unsafe { *value_ptr }, 1234);
         let casted = cast_to_linked(value_ptr);
         assert_eq!(casted, ptr);
 
         let ptr = collector.link_boxed([1, 2, 3]);
         let value_ptr = cast_from_linked(ptr);
-        eprintln!("{ptr:p}, {value_ptr:p}");
-        assert_eq!(unsafe{*value_ptr}, [1, 2, 3]);
+        assert_eq!(unsafe { *value_ptr }, [1, 2, 3]);
         let casted = cast_to_linked(value_ptr);
         assert_eq!(casted, ptr);
     }

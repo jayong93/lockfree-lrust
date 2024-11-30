@@ -1,6 +1,6 @@
 use std::{
     borrow::Borrow,
-    mem::ManuallyDrop,
+    mem::{self, ManuallyDrop},
     ops::Deref,
     process::abort,
     ptr::{self, NonNull},
@@ -219,7 +219,7 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
             &'a G,
         ) -> Result<
             Shared<'a, RefCountedInner<T>>,
-            crate::reclaim::CompareExchangeError<'a, RefCountedInner<T>>,
+            crate::reclaim::CompareExchangeError<'a, RefCountedInner<T>, Shared<'a, RefCountedInner<T>>, G>,
         >,
     {
         let expected = if let Some(current) = expected {

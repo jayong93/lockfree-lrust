@@ -7,12 +7,10 @@ desc_ptr_ty: lldb.SBType | None = None
 def init_head(head_expr: str):
     global pointer_ty, desc_ptr_ty
     pointer_ty = (
-        lldb.frame.GetValueForVariablePath(head_expr)
-        .type.template_args[0]
-        .GetPointerType()
+        lldb.frame.GetValueForVariablePath(head_expr).type
     )
     desc_ptr_ty = (
-        pointer_ty.GetPointeeType().members[-1].type.template_args[0].GetPointerType()
+        pointer_ty.GetPointeeType().template_args[0].members[-1].type.template_args[0].GetPointerType()
     )
 
 
@@ -48,11 +46,12 @@ def expr_as_node(expr: str, output=False):
 
 
 def deref_node(val: lldb.SBValue) -> tuple[lldb.SBValue, bool]:
+    # `val` is `Linked<Node<..>>*`
     addr: int = val.data.uint64[0]
     if addr % 2 == 1:
         return (
             val.CreateValueFromData(
-                "aligned",
+                "removed",
                 lldb.SBData.CreateDataFromInt(addr - 1, size=8),
                 type=pointer_ty,
             ),
@@ -64,8 +63,8 @@ def deref_node(val: lldb.SBValue) -> tuple[lldb.SBValue, bool]:
 def follow_from_tail(tail: lldb.value):
     cur_node = tail
     visited = set([int(cur_node)])
-    while int(cur_node.prev.data.v.value) != 0:
-        cur_node = value_as_node(cur_node.prev.data.v.value)
+    while int(cur_node.value.prev[0].p.value) != 0:
+        cur_node = value_as_node(cur_node.value.prev[0].p.value)
         if int(cur_node) in visited:
             print(f"{cur_node} was visited")
             break
