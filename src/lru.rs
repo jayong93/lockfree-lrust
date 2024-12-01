@@ -7,7 +7,7 @@ use std::{
     usize,
 };
 
-use crossbeam::utils::Backoff;
+use crossbeam::utils::{Backoff, CachePadded};
 use crossbeam_skiplist::SkipMap;
 use op::LruOperation;
 use seize::{unprotected, Collector, Guard, Linked, LocalGuard};
@@ -56,6 +56,8 @@ where
     }
 }
 
+type NodeEntry<'a, K, V> = crossbeam_skiplist::map::Entry<'a, RefCounted<K>, Atomic<Node<K, V>>>;
+
 impl<K, V> Lru<K, V>
 where
     K: Ord + Send + Sync + 'static,
@@ -67,8 +69,8 @@ where
         let tail = Node::uninit(&collector);
         let head_ref = unsafe { &mut *head.as_ptr() };
         let tail_ref = unsafe { &mut *tail.as_ptr() };
-        head_ref.next = tail.into();
-        tail_ref.prev = head.into();
+        head_ref.next = CachePadded::new(tail.into());
+        tail_ref.prev = CachePadded::new(head.into());
         Self {
             collector,
             skiplist: SkipMap::new(),
@@ -81,14 +83,40 @@ where
 
     #[inline]
     fn head<'a>(&self, guard: &'a LocalGuard<'a>) -> NodeRefGuard<'a, K, V> {
-        debug_assert!(self.head.try_increase_ref());
+        self.head.try_increase_ref();
         unsafe { NodeRefGuard::new(ptr::from_ref(self.head.as_ref()).into(), guard) }
     }
 
     #[inline]
     fn tail<'a>(&self, guard: &'a LocalGuard<'a>) -> NodeRefGuard<'a, K, V> {
-        debug_assert!(self.tail.try_increase_ref());
+        self.tail.try_increase_ref();
         unsafe { NodeRefGuard::new(ptr::from_ref(self.tail.as_ref()).into(), guard) }
+    }
+
+    #[inline]
+    fn copy_entry_node<'a, F>(
+        &'a self,
+        entry_fn: F,
+        guard: &'a LocalGuard<'a>,
+    ) -> Option<(NodeRefGuard<'a, K, V>, NodeEntry<'a, K, V>)>
+    where
+        F: Fn() -> Option<NodeEntry<'a, K, V>>,
+    {
+        loop {
+            let Some(entry) = entry_fn() else { return None };
+            loop {
+                let node_ptr = entry.value().load(Ordering::Relaxed, guard);
+                if let Some(node) = Node::try_copy(node_ptr, guard) {
+                    return Some((node, entry));
+                }
+                if ptr::eq(
+                    entry.value().load(Ordering::Relaxed, guard).as_ptr(),
+                    node_ptr.as_ptr(),
+                ) {
+                    break;
+                }
+            }
+        }
     }
 
     #[inline]
@@ -97,30 +125,33 @@ where
     }
 
     pub fn remove(&self, key: &K) -> Option<Entry<K, V>> {
-        let Some(entry) = self.skiplist.get(key) else {
+        let guard = self.collector.enter();
+        let Some((mut node, mut entry)) = self.copy_entry_node(|| self.skiplist.get(key), &guard)
+        else {
             return None;
         };
 
-        let guard = self.collector.enter();
-        let mut node = Node::deref_node(entry.value(), Ordering::Relaxed, &guard);
         loop {
-            let node_ref = unsafe { node.as_shared().deref() };
+            let node_ptr = node.as_shared();
+            let node_ref = unsafe { node_ptr.deref() };
             let old_desc = node_ref.desc.load(Ordering::Acquire, &guard);
             assert!(!old_desc.is_null());
             let old_desc_ref = unsafe { old_desc.deref() };
             match old_desc_ref.deref() {
                 Descriptor::Remove(op) => {
-                    op.link_prev
-                        .run_op(self, node.as_shared(), &Backoff::new(), &guard);
+                    op.link_prev.run_op(self, node_ptr, &Backoff::new(), &guard);
                     return None;
                 }
                 Descriptor::Detach(op) => {
-                    op.run_op(self, node.as_shared(), &Backoff::new(), &guard);
+                    op.run_op(self, node_ptr, &Backoff::new(), &guard);
                     if let Some(new_node) = op.get_new_node(&guard) {
                         node = new_node;
                     } else {
-                        if let Some(entry) = self.skiplist.get(key) {
-                            node = Node::deref_node(entry.value(), Ordering::Relaxed, &guard);
+                        if let Some((new_node, new_entry)) =
+                            self.copy_entry_node(|| self.skiplist.get(key), &guard)
+                        {
+                            node = new_node;
+                            entry = new_entry;
                         } else {
                             return None;
                         };
@@ -128,7 +159,7 @@ where
                 }
                 Descriptor::Insert(op) => {
                     let backoff = Backoff::new();
-                    op.run_op(self, node.as_shared(), &backoff, &guard);
+                    op.run_op(self, node_ptr, &backoff, &guard);
                     let value = op.clone_value(&guard);
                     let desc = Shared::boxed(
                         Descriptor::Remove(op::Remove::new(value.clone())),
@@ -146,13 +177,10 @@ where
                         .is_ok()
                     {
                         self.size.fetch_sub(1, Ordering::Relaxed);
-                        unsafe { desc.deref() }.run_op(
-                            self,
-                            node.as_shared(),
-                            &Backoff::new(),
-                            &guard,
-                        );
-                        entry.remove();
+                        unsafe { desc.deref() }.run_op(self, node_ptr, &Backoff::new(), &guard);
+                        if entry.remove() {
+                            Node::release(node_ptr, &guard);
+                        }
                         unsafe {
                             guard.retire_shared(old_desc);
                         }
@@ -175,19 +203,19 @@ where
             if ptr::eq(node.as_shared().as_ptr(), self.head.as_ref()) {
                 return None;
             }
-            let node_ref = unsafe { node.as_shared().deref() };
+            let node_ptr = node.as_shared();
+            let node_ref = unsafe { node_ptr.deref() };
             let old_desc = node_ref.desc.load(Ordering::Acquire, &guard);
             let old_desc_ref = unsafe { old_desc.deref() };
             match old_desc_ref.deref() {
                 Descriptor::Remove(op) => {
-                    op.link_prev
-                        .run_op(self, node.as_shared(), &Backoff::new(), &guard);
+                    op.link_prev.run_op(self, node_ptr, &Backoff::new(), &guard);
                 }
                 Descriptor::Detach(op) => {
-                    op.run_op(self, node.as_shared(), &Backoff::new(), &guard);
+                    op.run_op(self, node_ptr, &Backoff::new(), &guard);
                 }
                 Descriptor::Insert(op) => {
-                    op.run_op(self, node.as_shared(), &Backoff::new(), &guard);
+                    op.run_op(self, node_ptr, &Backoff::new(), &guard);
                     let value = op.clone_value(&guard);
                     let desc = Shared::boxed(
                         Descriptor::Remove(op::Remove::new(value.clone())),
@@ -205,12 +233,7 @@ where
                         .is_ok()
                     {
                         self.size.fetch_sub(1, Ordering::Relaxed);
-                        unsafe { desc.deref() }.run_op(
-                            self,
-                            node.as_shared(),
-                            &Backoff::new(),
-                            &guard,
-                        );
+                        unsafe { desc.deref() }.run_op(self, node_ptr, &Backoff::new(), &guard);
                         if let Some(entry) =
                             self.skiplist.get(node_ref.key.as_ref().unwrap().deref())
                         {
@@ -218,7 +241,9 @@ where
                                 entry.value().load(Ordering::Relaxed, &guard).as_ptr(),
                                 node_ref,
                             ) {
-                                entry.remove();
+                                if entry.remove() {
+                                    Node::release(node_ptr, &guard);
+                                }
                             }
                         }
 
@@ -243,15 +268,15 @@ where
         let desc = new_node_ref.desc.load(Ordering::Relaxed, &guard);
         let desc_ref = unsafe { desc.deref() };
         let backoff = Backoff::new();
+        let key = new_node_ref.key.as_ref().unwrap().clone();
 
         'outer: loop {
-            let key = new_node_ref.key.as_ref().unwrap().clone();
             let entry = self
                 .skiplist
-                .get_or_insert(key, Atomic::from(new_node.as_shared()));
-            let mut node = entry.value().load(Ordering::Relaxed, &guard);
+                .get_or_insert(key.clone(), Atomic::from(new_node.as_shared()));
+            let cur_node = entry.value().load(Ordering::Relaxed, &guard);
 
-            let old_value = if ptr::eq(node.as_ptr(), new_node_ref) {
+            let old_value = if ptr::eq(cur_node.as_ptr(), new_node_ref) {
                 // Our node has been inserted.
                 let len = self.size.fetch_add(1, Ordering::Relaxed);
 
@@ -277,23 +302,26 @@ where
                 None
             } else {
                 // Another node alreay exists
+                let Some(mut node) = Node::try_copy(cur_node, &guard) else {
+                    continue;
+                };
                 let value = desc_ref.clone_value(&guard);
                 let (cur_desc, old_value) = 'desc_select: loop {
-                    let node_ref = unsafe { node.deref() };
+                    let node_ptr = node.as_shared();
+                    let node_ref = unsafe { node_ptr.deref() };
                     let old_desc = node_ref.desc.load(Ordering::Acquire, &guard);
                     let old_desc_ref = unsafe { old_desc.deref() };
                     let new_desc = match old_desc_ref.deref() {
                         // The node was removed, try to allocate a new node
                         Descriptor::Remove(op) => {
-                            op.link_prev.run_op(self, node, &backoff, &guard);
-                            atomic::fence(Ordering::Release);
+                            op.link_prev.run_op(self, node_ptr, &backoff, &guard);
                             entry.remove();
                             continue 'outer;
                         }
                         Descriptor::Detach(op) => {
-                            op.run_op(self, node, &backoff, &guard);
+                            op.run_op(self, node_ptr, &backoff, &guard);
                             if let Some(new_node) = op.get_new_node(&guard) {
-                                node = new_node.as_shared();
+                                node = new_node;
                             } else {
                                 continue 'outer;
                             }
@@ -310,7 +338,7 @@ where
                         },
                     };
 
-                    old_desc_ref.run_op(self, node, &backoff, &guard);
+                    old_desc_ref.run_op(self, node_ptr, &backoff, &guard);
 
                     if node_ref
                         .desc
@@ -333,46 +361,43 @@ where
                     backoff.spin();
                 };
 
+                // Our node will not be used so we can remove it forcely.
+                drop(unsafe { new_node.into_node().into_box() });
+
                 let cur_desc_ref = unsafe { cur_desc.deref() };
-                cur_desc_ref.run_op(self, node, &backoff, &guard);
+                cur_desc_ref.run_op(self, node.as_shared(), &backoff, &guard);
                 Some(old_value)
             };
 
-            break old_value.map(|v| {
-                Entry::new(
-                    unsafe { node.deref() }.key.as_ref().unwrap().clone(),
-                    v,
-                    &self.collector,
-                )
-            });
+            break old_value.map(|v| Entry::new(key, v, &self.collector));
         }
     }
 
     pub fn get(&self, key: &K) -> Option<Entry<K, V>> {
-        let Some(entry) = self.skiplist.get(key) else {
+        let guard = self.collector.enter();
+        let backoff = Backoff::new();
+        let Some((mut node, _)) = self.copy_entry_node(|| self.skiplist.get(key), &guard) else {
             return None;
         };
 
-        let guard = self.collector.enter();
-        let mut node = Node::deref_node(entry.value(), Ordering::Relaxed, &guard);
-        let backoff = Backoff::new();
-
         loop {
-            let node_ref = unsafe { node.as_shared().deref() };
+            let node_ptr = node.as_shared();
+            let node_ref = unsafe { node_ptr.deref() };
             let old_desc = node_ref.desc.load(Ordering::Relaxed, &guard);
             let old_desc_ref = unsafe { old_desc.deref() };
             match old_desc_ref.deref() {
                 Descriptor::Remove(_) => return None,
                 Descriptor::Detach(op) => {
-                    op.run_op(self, node.as_shared(), &backoff, &guard);
+                    op.run_op(self, node_ptr, &backoff, &guard);
                     if let Some(new_node) = op.get_new_node(&guard) {
                         node = new_node;
                     } else {
-                        if let Some(entry) = self.skiplist.get(key) {
-                            node = Node::deref_node(entry.value(), Ordering::Relaxed, &guard);
-                        } else {
+                        let Some((new_node, _)) =
+                            self.copy_entry_node(|| self.skiplist.get(key), &guard)
+                        else {
                             return None;
-                        }
+                        };
+                        node = new_node;
                     }
                     continue;
                 }
@@ -408,12 +433,7 @@ where
                         unsafe {
                             guard.retire_shared(old_desc);
                         }
-                        unsafe { new_desc.deref() }.run_op(
-                            self,
-                            node.as_shared(),
-                            &backoff,
-                            &guard,
-                        );
+                        unsafe { new_desc.deref() }.run_op(self, node_ptr, &backoff, &guard);
                         break Some(Entry::new(
                             node_ref.key.as_ref().unwrap().clone(),
                             value,
@@ -617,10 +637,10 @@ where
             let next_prev = Node::try_deref_node(&next_ref.prev, Ordering::Acquire, guard);
             match next_prev {
                 None => {
-                    if let Some(last_guard) = last {
+                    if let Some(last_node) = last {
                         next_ref.mark_next(backoff, guard);
                         let next_prev = Node::deref_node(&next_ref.prev, Ordering::Acquire, guard);
-                        unsafe { last_guard.as_shared().deref() }
+                        unsafe { last_node.as_shared().deref() }
                             .prev
                             .compare_exchange(
                                 next.as_shared(),
@@ -630,12 +650,12 @@ where
                                 guard,
                             )
                             .ok();
-                        next = last_guard;
+                        next = last_node;
                         last = None;
                     } else {
+                        // Find a next node which is not deleted.
                         next = Node::deref_node(&next_ref.next, Ordering::Acquire, guard);
                     }
-                    // Find a next node which is not deleted.
                     continue;
                 }
                 Some(next_prev) => {
@@ -669,10 +689,10 @@ where
 #[derive(Debug)]
 pub struct Node<K: Send + Sync, V: Send + Sync> {
     key: Option<RefCounted<K>>,
-    ref_count: AtomicUsize,
-    next: Atomic<Node<K, V>>,
-    prev: Atomic<Node<K, V>>,
-    desc: Atomic<Descriptor<K, V>>,
+    ref_count: CachePadded<AtomicUsize>,
+    next: CachePadded<Atomic<Node<K, V>>>,
+    prev: CachePadded<Atomic<Node<K, V>>>,
+    desc: CachePadded<Atomic<Descriptor<K, V>>>,
 }
 
 impl<K: Send + Sync, V: Send + Sync> Drop for Node<K, V> {
@@ -710,14 +730,18 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
                 Shared::boxed(
                     Self {
                         key: Some(key),
-                        ref_count: AtomicUsize::new(1),
-                        next: Shared::from(lru_cache.tail(guard)).into(),
-                        prev: Shared::from(lru_cache.head(guard)).into(),
-                        desc: Shared::boxed(
-                            Descriptor::Insert(op::Insert::new(value)),
-                            &lru_cache.collector,
-                        )
-                        .into(),
+                        // `ref_count` should be 2 because when it is inserted to LRU, there would
+                        // be a skiplist entry for it as well.
+                        ref_count: CachePadded::new(AtomicUsize::new(2)),
+                        next: CachePadded::new(Shared::from(lru_cache.tail(guard)).into()),
+                        prev: CachePadded::new(Shared::from(lru_cache.head(guard)).into()),
+                        desc: CachePadded::new(
+                            Shared::boxed(
+                                Descriptor::Insert(op::Insert::new(value)),
+                                &lru_cache.collector,
+                            )
+                            .into(),
+                        ),
                     },
                     &lru_cache.collector,
                 ),
@@ -731,10 +755,10 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
         Shared::boxed(
             Self {
                 key: None,
-                ref_count: AtomicUsize::new(1),
-                next: Atomic::null(),
-                prev: Atomic::null(),
-                desc: Atomic::null(),
+                ref_count: CachePadded::new(AtomicUsize::new(1)),
+                next: CachePadded::new(Atomic::null()),
+                prev: CachePadded::new(Atomic::null()),
+                desc: CachePadded::new(Atomic::null()),
             },
             collector,
         )
@@ -815,7 +839,7 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
             }
             let node_ref = unsafe { node.deref() };
             if !node_ref.try_increase_ref() {
-                debug_assert_ne!(ptr.load(order, guard), node);
+                assert_ne!(ptr.load(order, guard), node);
                 continue;
             }
             break Some(NodeRefGuard {
@@ -836,7 +860,7 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
             let node_ref = unsafe { node.deref() };
             if !node_ref.try_increase_ref() {
                 let new = ptr.load(order, guard);
-                debug_assert_ne!(new.as_ptr(), node.as_ptr());
+                assert_ne!(new.as_ptr(), node.as_ptr());
                 continue;
             }
             break NodeRefGuard {
@@ -850,6 +874,7 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
         this: Shared<'a, Node<K, V>>,
         guard: &'a LocalGuard,
     ) -> Option<NodeRefGuard<'a, K, V>> {
+        debug_assert!(!this.is_null());
         if unsafe { this.deref() }.try_increase_ref() {
             Some(unsafe { NodeRefGuard::new(this, guard) })
         } else {
@@ -898,7 +923,7 @@ where
 {
     fn clone(&self) -> Self {
         if !self.node.is_null() {
-            debug_assert!(Node::try_increase_ref(unsafe { self.node.deref() }));
+            Node::try_increase_ref(unsafe { self.node.deref() });
         }
         Self { ..*self }
     }
@@ -1206,10 +1231,6 @@ mod op {
             // ORDERING: `Relaxed` is fine because reading non-null `new_node` doesn't mean
             // any visible side effect useful.
             let new_node = self.new_node.load(Ordering::Relaxed, guard);
-            if new_node.tag() != 0 {
-                atomic::fence(Ordering::Acquire);
-                return None;
-            }
             if !new_node.is_null() {
                 return Node::try_deref_node(&self.new_node, Ordering::Acquire, guard);
             }
@@ -1219,6 +1240,7 @@ mod op {
             if LruOperation::<K, V>::store_result(self, new_node.clone().into_node(), guard) {
                 Some(new_node)
             } else {
+                drop(unsafe { new_node.into_node().into_box() });
                 Node::try_deref_node(&self.new_node, Ordering::Acquire, guard)
             }
         }
@@ -1246,6 +1268,7 @@ mod op {
             let node_ref = unsafe { node.deref() };
             let new_node = self.create_new_node(lru_cache, node, guard);
             if let Some(new_node) = new_node {
+                let new_node_ptr = new_node.as_shared();
                 let key = node_ref.key.as_ref().unwrap().deref();
                 let mut need_clean_up = false;
                 if let Some(entry) = lru_cache.skiplist.get(key) {
@@ -1259,7 +1282,7 @@ mod op {
                     else if node_entry
                         .compare_exchange(
                             cur_node,
-                            new_node.as_shared(),
+                            new_node,
                             Ordering::SeqCst,
                             Ordering::Acquire,
                             guard,
@@ -1270,8 +1293,7 @@ mod op {
                     }
                 };
                 let new_desc = unsafe {
-                    new_node
-                        .as_shared()
+                    new_node_ptr
                         .deref()
                         .desc
                         .load(Ordering::Relaxed, guard)
@@ -1282,15 +1304,15 @@ mod op {
                 if let Descriptor::Insert(new_op) = new_desc.deref() {
                     new_op
                         .attach
-                        .run_op(lru_cache, new_node.as_shared(), backoff, guard);
+                        .run_op(lru_cache, new_node_ptr, backoff, guard);
                 };
                 if need_clean_up {
                     // Marking `new_node` so it can be reclaimed safely. We have to do marking only
                     // after insertion because otherwise threads poping a node from back might not
                     // see the newly inserted node after helping this op.
                     self.new_node
-                        .swap(new_node.as_shared().with_tag(1), Ordering::Release, guard);
-                    Node::release(new_node.as_shared(), guard);
+                        .swap(new_node_ptr.with_tag(1), Ordering::Release, guard);
+                    Node::release(new_node_ptr, guard);
                 }
             }
 

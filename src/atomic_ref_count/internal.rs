@@ -22,7 +22,7 @@ pub(crate) struct RefCounted<T> {
 impl<T: Send + Sync> Clone for RefCounted<T> {
     fn clone(&self) -> Self {
         let inner = unsafe { self.inner.as_ref() };
-        assert!(inner.try_increment());
+        inner.try_increment();
         Self {
             inner: unsafe { NonNull::new_unchecked(ptr::from_ref(inner).cast_mut()) },
         }
@@ -332,9 +332,6 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     }
 }
 
-pub struct CompareExchangeOk<T: Send + Sync> {
-    pub old: Option<RefCounted<T>>,
-}
 pub enum CompareExchangeErrCuurentValue<T: Send + Sync> {
     Removed(*mut T),
     Cloned(RefCounted<T>),

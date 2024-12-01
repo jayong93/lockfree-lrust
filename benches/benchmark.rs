@@ -10,7 +10,7 @@ pub fn bench_eviction(c: &mut Criterion) {
             std::thread::scope(|s| {
                 for _ in 0..8 {
                     s.spawn(|| {
-                        for i in 0..100000000 {
+                        for i in 0..1000000 {
                             cache.put(i % 200 + 1, i);
                         }
                     });
@@ -27,7 +27,7 @@ pub fn bench_no_eviction(c: &mut Criterion) {
             std::thread::scope(|s| {
                 for _ in 0..8 {
                     s.spawn(|| {
-                        for i in 0..100000000 {
+                        for i in 0..1000000 {
                             cache.put(i % 10 + 1, i);
                         }
                     });
@@ -45,13 +45,13 @@ pub fn bench_put_and_remove(c: &mut Criterion) {
                 for i in 0..8 {
                     if i % 2 == 0 {
                         s.spawn(|| {
-                            for i in 0..100000000 {
+                            for i in 0..1000000 {
                                 cache.put(i % 200 + 1, i);
                             }
                         });
                     } else {
                         s.spawn(|| {
-                            for i in 0..100000000 {
+                            for i in 0..1000000 {
                                 cache.remove(&(i % 200 + 1));
                             }
                         });
@@ -62,5 +62,5 @@ pub fn bench_put_and_remove(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_eviction, bench_no_eviction, bench_put_and_remove);
+criterion_group!(name=benches; config=Criterion::default().sample_size(10); targets=bench_eviction, bench_no_eviction, bench_put_and_remove);
 criterion_main!(benches);
