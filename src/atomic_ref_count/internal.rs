@@ -350,6 +350,7 @@ struct RefCountedInner<T> {
 }
 
 impl<T> RefCountedInner<T> {
+    #[inline]
     fn new(data: T, collector: &Collector) -> *mut Linked<Self> {
         collector.link_boxed(Self {
             ref_count: AtomicUsize::new(1),

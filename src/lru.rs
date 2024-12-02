@@ -143,7 +143,6 @@ where
             let node_ptr = node.as_shared();
             let node_ref = unsafe { node_ptr.deref() };
             let old_desc = node_ref.desc.load(Ordering::Acquire, &guard);
-            assert!(!old_desc.is_null());
             let old_desc_ref = unsafe { old_desc.deref() };
             match old_desc_ref.deref() {
                 Descriptor::Remove(op) => {
@@ -468,6 +467,8 @@ where
                 return;
             }
 
+            let node_next = node_ref.next.load(Ordering::Acquire, guard);
+
             let mru_node_ref = unsafe { mru_node.node.deref() };
             let mru_prev = mru_node_ref.prev.load(Ordering::Relaxed, guard);
             if mru_prev != Shared::from(ptr::from_ref(head_ref)) {
@@ -482,6 +483,33 @@ where
                 )
             {
                 break;
+            }
+
+            atomic::fence(Ordering::Acquire);
+            let new_node_next = node_ref.next.load(Ordering::Relaxed, guard);
+            if !ptr::eq(new_node_next.as_ptr(), mru_node_ref) {
+                // `node.next` is not changed as `mru_node` yet.
+                if ptr::eq(node_next.as_ptr(), new_node_next.as_ptr()) {
+                    if let Err(err) = node_ref.next.compare_exchange(
+                        node_next.without_tag(),
+                        mru_node.clone(),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        guard,
+                    ) {
+                        if err.current.tag() != 0 {
+                            return;
+                        }
+                        if !ptr::eq(err.current.as_ptr(), mru_node_ref) {
+                            backoff.spin();
+                            continue;
+                        }
+                    }
+                }
+                // `node` was already inserted to list or `mru_node` is not a MRU node anymore.
+                else {
+                    continue;
+                }
             }
 
             if let Err(err) = mru_node_ref.prev.compare_exchange_weak(
@@ -501,15 +529,9 @@ where
                     return;
                 }
 
-                if err.current.tag() != 0 {
-                    mru_node = self.help_link(err.current, mru_node, &Backoff::new(), guard);
-                } else {
-                    Node::deref_node(&head_ref.next, Ordering::Acquire, guard);
-                }
                 backoff.spin();
                 continue;
             }
-            self.help_link(node.as_shared(), mru_node, &Backoff::new(), guard);
             break;
         }
 
@@ -534,7 +556,7 @@ where
                 .is_ok()
             {
                 if node_ref.next.load(Ordering::Relaxed, guard).tag() != 0 {
-                    self.help_link(head.as_shared(), node.clone(), &Backoff::new(), guard);
+                    self.help_link(head.as_shared(), node, &Backoff::new(), guard);
                 }
                 break;
             }
@@ -670,17 +692,15 @@ where
                         continue;
                     }
 
-                    if next_ref
-                        .prev
-                        .compare_exchange_weak(
-                            node.without_tag(),
-                            prev.clone(),
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                            guard,
-                        )
-                        .is_ok()
-                    {
+                    if let Err(err) = next_ref.prev.compare_exchange_weak(
+                        node.without_tag(),
+                        prev,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                        guard,
+                    ) {
+                        prev = err.new;
+                    } else {
                         return;
                     }
                     backoff.spin();
@@ -812,7 +832,7 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
     }
 
     fn release<'a>(this: Shared<'a, Self>, guard: &'a impl Guard) {
-        let mut stack: smallvec::SmallVec<[Shared<'a, Self>; 3]> = smallvec::smallvec![this];
+        let mut stack: smallvec::SmallVec<[Shared<'a, Self>; 5]> = smallvec::smallvec![this];
         while let Some(node) = stack.pop() {
             let node_ref = unsafe { node.deref() };
             if node_ref.ref_count.fetch_sub(1, Ordering::Release) == 1 {
