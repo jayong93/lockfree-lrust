@@ -120,6 +120,14 @@ where
     }
 
     #[inline]
+    fn remove_entry<'a>(entry: NodeEntry<'a, K, V>, guard: &'a LocalGuard) {
+        if entry.remove() {
+            let node = entry.value().load(Ordering::Relaxed, guard);
+            Node::release(node, guard);
+        }
+    }
+
+    #[inline]
     pub fn len(&self) -> usize {
         self.size.load(Ordering::Relaxed)
     }
@@ -178,9 +186,7 @@ where
                     {
                         self.size.fetch_sub(1, Ordering::Relaxed);
                         unsafe { desc.deref() }.run_op(self, node_ptr, &Backoff::new(), &guard);
-                        if entry.remove() {
-                            Node::release(node_ptr, &guard);
-                        }
+                        Self::remove_entry(entry, &guard);
                         unsafe {
                             guard.retire_shared(old_desc);
                         }
@@ -241,9 +247,7 @@ where
                                 entry.value().load(Ordering::Relaxed, &guard).as_ptr(),
                                 node_ref,
                             ) {
-                                if entry.remove() {
-                                    Node::release(node_ptr, &guard);
-                                }
+                                Self::remove_entry(entry, &guard);
                             }
                         }
 
@@ -315,7 +319,7 @@ where
                         // The node was removed, try to allocate a new node
                         Descriptor::Remove(op) => {
                             op.link_prev.run_op(self, node_ptr, &backoff, &guard);
-                            entry.remove();
+                            Self::remove_entry(entry, &guard);
                             continue 'outer;
                         }
                         Descriptor::Detach(op) => {

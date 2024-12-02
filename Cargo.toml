@@ -15,6 +15,7 @@ thread_local = "1.1.8"
 
 [dev-dependencies]
 criterion = "0.5"
+moka = {version="0.12", features=["sync"]}
 
 [[bench]]
 name = "benchmark"

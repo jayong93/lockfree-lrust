@@ -39,21 +39,39 @@ use lockfree_car::lru::Lru;
 fn test_put_and_remove() {
     let cache: Lru<usize, usize> = Lru::new(NonZeroUsize::new(100).unwrap());
     std::thread::scope(|s| {
-        for i in 0..16 {
+        for i in 0..4 {
             if i % 2 == 0 {
                 s.spawn(|| {
-                    for i in 0..1000000 {
+                    for i in 0..10000000 {
                         cache.put(i % 200 + 1, i);
                     }
                 });
             } else {
                 s.spawn(|| {
-                    for i in 0..1000000 {
+                    for i in 0..10000000 {
                         cache.remove(&(i % 200 + 1));
                     }
                 });
             }
         }
     });
+    // let cache = moka::sync::Cache::<usize, usize>::new(100);
+    // std::thread::scope(|s| {
+    //     for i in 0..16 {
+    //         if i % 2 == 0 {
+    //             s.spawn(|| {
+    //                 for i in 0..10000000 {
+    //                     cache.insert(i % 200 + 1, i);
+    //                 }
+    //             });
+    //         } else {
+    //             s.spawn(|| {
+    //                 for i in 0..10000000 {
+    //                     cache.remove(&(i % 200 + 1));
+    //                 }
+    //             });
+    //         }
+    //     }
+    // });
     assert!(cache.len() <= 100);
 }
