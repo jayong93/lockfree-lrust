@@ -60,6 +60,28 @@ pub fn bench_put_and_remove(c: &mut Criterion) {
             });
         });
     });
+    // let cache: moka::sync::Cache<usize, usize> = moka::sync::Cache::new(100);
+    // c.bench_function("bench_put_and_remove", |b| {
+    //     b.iter(|| {
+    //         std::thread::scope(|s| {
+    //             for i in 0..8 {
+    //                 if i % 2 == 0 {
+    //                     s.spawn(|| {
+    //                         for i in 0..1000000 {
+    //                             cache.insert(i % 200 + 1, i);
+    //                         }
+    //                     });
+    //                 } else {
+    //                     s.spawn(|| {
+    //                         for i in 0..1000000 {
+    //                             cache.remove(&(i % 200 + 1));
+    //                         }
+    //                     });
+    //                 }
+    //             }
+    //         });
+    //     });
+    // });
 }
 
 criterion_group!(name=benches; config=Criterion::default().sample_size(20); targets=bench_put_and_remove);

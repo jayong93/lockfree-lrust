@@ -10,11 +10,11 @@ use std::{
 use crossbeam::utils::{Backoff, CachePadded};
 use crossbeam_skiplist::SkipMap;
 use op::LruOperation;
-use seize::{unprotected, Collector, Guard, Linked, LocalGuard};
+use seize::{unprotected, Collector, Guard, Linked, LocalGuard, UnprotectedGuard};
 
 use crate::{
     atomic_ref_count::internal::{AtomicRefCounted, RefCounted},
-    reclaim::{Pointer, RetireShared},
+    reclaim::{FreeList, Freeable, Pointer, RetireShared},
 };
 use crate::{
     atomic_ref_count::Entry,
@@ -27,6 +27,7 @@ where
     V: Send + Sync + 'static,
 {
     collector: Box<Collector>,
+    free_list: FreeList<Linked<Node<K, V>>>,
     skiplist: SkipMap<RefCounted<K>, Atomic<Node<K, V>>>,
     // `head` and `tail` are sentry nodes which have no valid data
     head: Box<Linked<Node<K, V>>>,
@@ -45,6 +46,7 @@ where
 {
     fn drop(&mut self) {
         self.skiplist.clear();
+        // TODO: Reclaim free list
         // TODO: Delete this line because it is only for testing
         unsafe {
             Box::leak(mem::replace(
@@ -73,6 +75,7 @@ where
         tail_ref.prev = CachePadded::new(head.into());
         Self {
             collector,
+            free_list: FreeList::new(),
             skiplist: SkipMap::new(),
             head: unsafe { head.into_box() },
             tail: unsafe { tail.into_box() },
@@ -130,6 +133,21 @@ where
     #[inline]
     pub fn len(&self) -> usize {
         self.size.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    unsafe fn free_node(&self, node: Shared<'_, Node<K, V>>) {
+        debug_assert!(!node.is_null());
+        let guard = &unsafe { unprotected() };
+        let node_ref = unsafe { &mut *node.as_ptr() };
+        node_ref.key = None;
+        let next = node_ref.next.load(Ordering::Relaxed, guard);
+        Node::release(next, guard);
+        let prev = node_ref.prev.load(Ordering::Relaxed, guard);
+        Node::release(prev, guard);
+        let desc = node_ref.desc.load(Ordering::Relaxed, guard);
+        unsafe { guard.retire_shared(desc) };
+        unsafe { self.free_list.free(node_ref.into()) };
     }
 
     pub fn remove(&self, key: &K) -> Option<Entry<K, V>> {
@@ -365,7 +383,7 @@ where
                 };
 
                 // Our node will not be used so we can remove it forcely.
-                drop(unsafe { new_node.into_node().into_box() });
+                unsafe { self.free_node(new_node.into_node()) };
 
                 let cur_desc_ref = unsafe { cur_desc.deref() };
                 cur_desc_ref.run_op(self, node.as_shared(), &backoff, &guard);
@@ -749,29 +767,35 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
         lru_cache: &Lru<K, V>,
         guard: &'a LocalGuard<'a>,
     ) -> NodeRefGuard<'a, K, V> {
-        unsafe {
-            NodeRefGuard::new(
-                Shared::boxed(
-                    Self {
-                        key: Some(key),
-                        // `ref_count` should be 2 because when it is inserted to LRU, there would
-                        // be a skiplist entry for it as well.
-                        ref_count: CachePadded::new(AtomicUsize::new(2)),
-                        next: CachePadded::new(Shared::from(lru_cache.tail(guard)).into()),
-                        prev: CachePadded::new(Shared::from(lru_cache.head(guard)).into()),
-                        desc: CachePadded::new(
-                            Shared::boxed(
-                                Descriptor::Insert(op::Insert::new(value)),
-                                &lru_cache.collector,
-                            )
-                            .into(),
-                        ),
-                    },
-                    &lru_cache.collector,
-                ),
-                guard,
+        let desc = Shared::boxed(
+            Descriptor::Insert(op::Insert::new(value)),
+            &lru_cache.collector,
+        );
+
+        let free_node = unsafe { lru_cache.free_list.reuse() };
+        // `ref_count` should be 2 because when it is inserted to LRU, there would
+        // be a skiplist entry for it as well.
+        let new_node = if let Some(mut ptr) = free_node {
+            let node = unsafe { ptr.as_mut() };
+            node.key = Some(key);
+            node.ref_count.store(2, Ordering::Relaxed);
+            node.next.store(lru_cache.tail(guard), Ordering::Relaxed);
+            node.prev.store(lru_cache.head(guard), Ordering::Relaxed);
+            node.desc.store::<_, LocalGuard>(desc, Ordering::Relaxed);
+            Shared::from(ptr.as_ptr())
+        } else {
+            Shared::boxed(
+                Self {
+                    key: Some(key),
+                    ref_count: CachePadded::new(AtomicUsize::new(2)),
+                    next: CachePadded::new(Shared::from(lru_cache.tail(guard)).into()),
+                    prev: CachePadded::new(Shared::from(lru_cache.head(guard)).into()),
+                    desc: CachePadded::new(desc.into()),
+                },
+                &lru_cache.collector,
             )
-        }
+        };
+        unsafe { NodeRefGuard::new(new_node, guard) }
     }
 
     #[inline]
@@ -848,6 +872,19 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
                 unsafe { guard.retire_shared(node) };
             };
         }
+        // let node_ref = unsafe { this.deref() };
+        // if node_ref.ref_count.fetch_sub(1, Ordering::Release) == 1 {
+        //     atomic::fence(Ordering::Acquire);
+        //     let next = node_ref.next.load(Ordering::Relaxed, guard);
+        //     if !next.is_null() {
+        //         Self::release(next, guard);
+        //     }
+        //     let prev = node_ref.prev.load(Ordering::Relaxed, guard);
+        //     if !prev.is_null() {
+        //         Self::release(prev, guard);
+        //     }
+        //     unsafe { guard.retire_shared(this) };
+        // }
     }
 
     fn try_deref_node<'a>(
@@ -928,6 +965,24 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
             }
             break;
         }
+    }
+}
+
+impl<K: Send + Sync, V: Send + Sync> Freeable for Linked<Node<K, V>> {
+    fn connect(&mut self, other: *mut Self) {
+        self.next
+            .store::<_, UnprotectedGuard>(Shared::from(other), Ordering::Relaxed);
+    }
+
+    fn next(&self) -> *mut Self {
+        self.next
+            .load(Ordering::Relaxed, &unsafe { unprotected() })
+            .as_ptr()
+    }
+
+    fn dealloc(this: *mut Self) {
+        let guard = unsafe { unprotected() };
+        unsafe { guard.retire_shared(this.into()) };
     }
 }
 
@@ -1264,7 +1319,7 @@ mod op {
             if LruOperation::<K, V>::store_result(self, new_node.clone().into_node(), guard) {
                 Some(new_node)
             } else {
-                drop(unsafe { new_node.into_node().into_box() });
+                unsafe { lru_cache.free_node(new_node.into_node()) };
                 Node::try_deref_node(&self.new_node, Ordering::Acquire, guard)
             }
         }

@@ -1,6 +1,8 @@
 pub(crate) use seize::{Collector, Guard, Linked};
+use thread_local::ThreadLocal;
 
 use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::{fmt, ptr};
 
@@ -70,7 +72,7 @@ impl<T> Atomic<T> {
             Ok(ptr) => Ok(unsafe { P::new_with_guard(ptr.into(), guard) }),
             Err(current) => Err(CompareExchangeError {
                 current: current.into(),
-                new: unsafe{P::new_with_guard(new, guard)},
+                new: unsafe { P::new_with_guard(new, guard) },
                 _marker: Default::default(),
             }),
         }
@@ -93,10 +95,10 @@ impl<T> Atomic<T> {
             .0
             .compare_exchange_weak(current.ptr, new.ptr, success, failure)
         {
-            Ok(ptr) => Ok(unsafe{P::new_with_guard(ptr.into(), guard)}),
+            Ok(ptr) => Ok(unsafe { P::new_with_guard(ptr.into(), guard) }),
             Err(current) => Err(CompareExchangeError {
                 current: current.into(),
-                new: unsafe{P::new_with_guard(new, guard)},
+                new: unsafe { P::new_with_guard(new, guard) },
                 _marker: Default::default(),
             }),
         }
@@ -277,6 +279,67 @@ where
 {
     unsafe fn new_with_guard(ptr: Shared<'a, T>, guard: &'a G) -> Self;
     fn as_shared(&self) -> Shared<'a, T>;
+}
+
+pub(crate) trait Freeable {
+    fn connect(&mut self, other: *mut Self);
+    fn next(&self) -> *mut Self;
+    fn dealloc(this: *mut Self);
+}
+
+pub(crate) struct FreeList<T>
+where
+    T: Freeable,
+{
+    storage: ThreadLocal<AtomicPtr<T>>,
+}
+
+impl<T> Drop for FreeList<T>
+where
+    T: Freeable,
+{
+    fn drop(&mut self) {
+        for head in self.storage.iter_mut() {
+            let entry = unsafe { head.load(Ordering::Relaxed).as_mut() };
+            let Some(mut entry) = entry else { continue };
+            loop {
+                let next = unsafe { entry.next().as_mut() };
+                Freeable::dealloc(ptr::from_mut(entry));
+                let Some(next) = next else { break };
+                entry = next;
+            }
+        }
+    }
+}
+
+impl<T> FreeList<T>
+where
+    T: Freeable,
+{
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            storage: ThreadLocal::new(),
+        }
+    }
+
+    #[inline]
+    pub(crate) unsafe fn free(&self, mut value: NonNull<T>) {
+        let head = self.storage.get_or(|| AtomicPtr::new(ptr::null_mut()));
+        let next_ptr = head.load(Ordering::Relaxed);
+        unsafe { value.as_mut() }.connect(next_ptr);
+        head.store(value.as_ptr(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) unsafe fn reuse(&self) -> Option<NonNull<T>> {
+        let head = self.storage.get_or(|| AtomicPtr::new(ptr::null_mut()));
+        let ptr = head.load(Ordering::Relaxed);
+        unsafe { ptr.as_ref() }.map(|entry| {
+            head.store(entry.next(), Ordering::Relaxed);
+            entry.into()
+        })
+    }
 }
 
 mod test {
