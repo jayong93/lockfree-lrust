@@ -84,5 +84,5 @@ pub fn bench_put_and_remove(c: &mut Criterion) {
     // });
 }
 
-criterion_group!(name=benches; config=Criterion::default().sample_size(20); targets=bench_put_and_remove);
+criterion_group!(name=benches; config=Criterion::default().sample_size(20); targets=bench_put_and_remove, bench_no_eviction, bench_eviction);
 criterion_main!(benches);

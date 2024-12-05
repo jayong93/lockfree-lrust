@@ -27,14 +27,16 @@ where
     K: Ord + Send + Sync + 'static,
     V: Send + Sync + 'static,
 {
-    collector: Box<Collector>,
-    free_list: Box<FreeList<Linked<Node<K, V>>>>,
     skiplist: SkipMap<RefCounted<K>, Atomic<Node<K, V>>>,
+    free_list: Box<FreeList<Linked<Node<K, V>>>>,
     // `head` and `tail` are sentry nodes which have no valid data
     head: Box<Linked<Node<K, V>>>,
     tail: Box<Linked<Node<K, V>>>,
     cap: NonZeroUsize,
     size: AtomicUsize,
+    // Collector must be the last member otherwise nodes in skiplist or free list will be freed
+    // twice.
+    collector: Box<Collector>,
 }
 
 unsafe impl<K: Ord + Send + Sync, V: Send + Sync> Send for Lru<K, V> {}
@@ -46,16 +48,11 @@ where
     V: Send + Sync + 'static,
 {
     fn drop(&mut self) {
-        self.skiplist.clear();
-        // TODO: Reclaim free list
-        // TODO: Delete this line because it is only for testing
-        unsafe {
-            Box::leak(mem::replace(
-                &mut self.collector,
-                Box::new(Collector::new()),
-            ))
-            .reclaim_all()
-        };
+        let guard = unsafe { unprotected() };
+        for entry in self.skiplist.iter() {
+            let node = entry.value().load(Ordering::Relaxed, &guard);
+            unsafe { guard.retire_shared(node) };
+        }
     }
 }
 
@@ -135,6 +132,16 @@ where
     #[inline]
     pub fn len(&self) -> usize {
         self.size.load(Ordering::Relaxed)
+    }
+
+    pub fn iter<'a>(&'a self) -> Iter<'a, K, V, LocalGuard<'a>> {
+        let guard = self.collector.enter();
+        let node = self.tail.prev.load(Ordering::Relaxed, &guard).as_ptr();
+        Iter {
+            guard,
+            collector: &self.collector,
+            node: node.into(),
+        }
     }
 
     pub fn remove(&self, key: &K) -> Option<Entry<K, V>> {
@@ -717,6 +724,46 @@ where
     }
 }
 
+pub struct Iter<'a, K, V, G>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    G: 'a,
+{
+    guard: G,
+    collector: &'a Collector,
+    node: Shared<'a, Node<K, V>>,
+}
+
+impl<'a, K, V, G> Iterator for Iter<'a, K, V, G>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    G: 'a + Guard,
+{
+    type Item = Entry<'a, K, V>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let node = unsafe { self.node.deref() };
+            let prev = node.prev.load(Ordering::Relaxed, &self.guard);
+            if prev.is_null() {
+                return None;
+            }
+            if prev.tag() != 0 {
+                continue;
+            }
+            self.node = prev.as_ptr().into();
+            let desc = node.desc.load(Ordering::Relaxed, &self.guard);
+            break Some(Entry::new(
+                node.key.as_ref().unwrap().clone(),
+                unsafe { desc.deref().clone_value(&self.guard) },
+                self.collector,
+            ));
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Node<K: Send + Sync, V: Send + Sync> {
     free_list: NonNull<FreeList<Linked<Node<K, V>>>>,
@@ -987,12 +1034,16 @@ impl<K: Send + Sync, V: Send + Sync> Freeable for Linked<Node<K, V>> {
 #[inline]
 unsafe fn free_node<K, V>(free_list: &FreeList<Linked<Node<K, V>>>, node: Shared<'_, Node<K, V>>)
 where
-    K: Send + Sync,
+    K: Send + Sync + Ord,
     V: Send + Sync,
 {
     debug_assert!(!node.is_null());
+    let guard = &unsafe { unprotected() };
     let node_ref = unsafe { &mut *node.as_ptr() };
     node_ref.key = None;
+    let desc = node_ref.desc.load(Ordering::Relaxed, guard);
+    node_ref.desc.store::<_, UnprotectedGuard>(Shared::null(), Ordering::Relaxed);
+    unsafe { guard.retire_shared(desc) };
     unsafe { free_list.free(node_ref.into()) };
 }
 
@@ -1008,9 +1059,13 @@ unsafe fn free_unused_node<K, V>(
     let guard = &unsafe { unprotected() };
     let node_ref = unsafe { &mut *node.as_ptr() };
     node_ref.key = None;
+    // We should release `prev` and `next` pointer of an unused node, which would be head and tail
+    // node respectively.
     Node::release(node_ref.next.load(Ordering::Relaxed, guard), guard);
     Node::release(node_ref.prev.load(Ordering::Relaxed, guard), guard);
-    unsafe { guard.retire_shared(node_ref.desc.load(Ordering::Relaxed, guard)) };
+    let desc = node_ref.desc.load(Ordering::Relaxed, guard);
+    node_ref.desc.store::<_, UnprotectedGuard>(Shared::null(), Ordering::Relaxed);
+    unsafe { guard.retire_shared(desc) };
     unsafe { free_list.free(node_ref.into()) };
 }
 
@@ -1025,7 +1080,7 @@ where
 
 impl<K, V, G> Guard for ReuseGuard<K, V, G>
 where
-    K: Send + Sync,
+    K: Send + Sync + Ord,
     V: Send + Sync,
     G: Guard,
 {
@@ -1182,7 +1237,10 @@ where
     K: Send + Sync,
     V: Send + Sync,
 {
-    fn clone_value(&self, guard: &LocalGuard) -> RefCounted<V> {
+    fn clone_value<G>(&self, guard: &G) -> RefCounted<V>
+    where
+        G: Guard,
+    {
         match self {
             Self::Insert(op) => op.clone_value(guard),
             Self::Remove(op) => op.value.clone(),
@@ -1613,7 +1671,10 @@ mod op {
             }
         }
 
-        pub fn clone_value(&self, guard: &LocalGuard) -> RefCounted<T> {
+        pub fn clone_value<G>(&self, guard: &G) -> RefCounted<T>
+        where
+            G: Guard,
+        {
             self.value.clone_inner(Ordering::Relaxed, guard).unwrap()
         }
     }
