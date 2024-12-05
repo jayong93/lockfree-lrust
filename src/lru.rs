@@ -135,6 +135,16 @@ where
         self.size.load(Ordering::Relaxed)
     }
 
+    pub fn iter<'a>(&'a self) -> Iter<'a, K, V, LocalGuard<'a>> {
+        let guard = self.collector.enter();
+        let node = self.tail.prev.load(Ordering::Relaxed, &guard).as_ptr();
+        Iter {
+            guard,
+            collector: &self.collector,
+            node: node.into(),
+        }
+    }
+
     #[inline]
     unsafe fn free_node(&self, node: Shared<'_, Node<K, V>>) {
         debug_assert!(!node.is_null());
@@ -728,6 +738,46 @@ where
     }
 }
 
+pub struct Iter<'a, K, V, G>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    G: 'a,
+{
+    guard: G,
+    collector: &'a Collector,
+    node: Shared<'a, Node<K, V>>,
+}
+
+impl<'a, K, V, G> Iterator for Iter<'a, K, V, G>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    G: 'a + Guard,
+{
+    type Item = Entry<'a, K, V>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let node = unsafe { self.node.deref() };
+            let prev = node.prev.load(Ordering::Relaxed, &self.guard);
+            if prev.is_null() {
+                return None;
+            }
+            if prev.tag() != 0 {
+                continue;
+            }
+            self.node = prev.as_ptr().into();
+            let desc = node.desc.load(Ordering::Relaxed, &self.guard);
+            break Some(Entry::new(
+                node.key.as_ref().unwrap().clone(),
+                unsafe { desc.deref().clone_value(&self.guard) },
+                self.collector,
+            ));
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Node<K: Send + Sync, V: Send + Sync> {
     key: Option<RefCounted<K>>,
@@ -1086,7 +1136,10 @@ where
     K: Send + Sync,
     V: Send + Sync,
 {
-    fn clone_value(&self, guard: &LocalGuard) -> RefCounted<V> {
+    fn clone_value<G>(&self, guard: &G) -> RefCounted<V>
+    where
+        G: Guard,
+    {
         match self {
             Self::Insert(op) => op.clone_value(guard),
             Self::Remove(op) => op.value.clone(),
@@ -1506,7 +1559,10 @@ mod op {
             }
         }
 
-        pub fn clone_value(&self, guard: &LocalGuard) -> RefCounted<T> {
+        pub fn clone_value<G>(&self, guard: &G) -> RefCounted<T>
+        where
+            G: Guard,
+        {
             self.value.clone_inner(Ordering::Relaxed, guard).unwrap()
         }
     }

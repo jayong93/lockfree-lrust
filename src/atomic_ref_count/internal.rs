@@ -172,7 +172,10 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     }
 
     #[inline]
-    pub fn clone_inner(&self, order: Ordering, guard: &LocalGuard) -> Option<RefCounted<T>> {
+    pub fn clone_inner<G>(&self, order: Ordering, guard: &G) -> Option<RefCounted<T>>
+    where
+        G: Guard,
+    {
         loop {
             if let Ok(cloned) = self.try_clone_inner(order, guard) {
                 break cloned;
@@ -181,11 +184,14 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
     }
 
     #[inline]
-    pub fn try_clone_inner(
+    pub fn try_clone_inner<G>(
         &self,
         order: Ordering,
-        guard: &LocalGuard,
-    ) -> Result<Option<RefCounted<T>>, ()> {
+        guard: &G,
+    ) -> Result<Option<RefCounted<T>>, ()>
+    where
+        G: Guard,
+    {
         let inner = self.inner.load(order, guard);
         if let Some(inner) = unsafe { inner.as_ref() } {
             if inner.try_increment() {
@@ -219,7 +225,12 @@ impl<T: Send + Sync> AtomicRefCounted<T> {
             &'a G,
         ) -> Result<
             Shared<'a, RefCountedInner<T>>,
-            crate::reclaim::CompareExchangeError<'a, RefCountedInner<T>, Shared<'a, RefCountedInner<T>>, G>,
+            crate::reclaim::CompareExchangeError<
+                'a,
+                RefCountedInner<T>,
+                Shared<'a, RefCountedInner<T>>,
+                G,
+            >,
         >,
     {
         let expected = if let Some(current) = expected {
