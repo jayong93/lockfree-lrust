@@ -1,8 +1,9 @@
 use std::{
+    marker::PhantomData,
     mem,
     num::NonZeroUsize,
     ops::Deref,
-    ptr::{self},
+    ptr::{self, NonNull},
     sync::atomic::{self, AtomicUsize, Ordering},
     usize,
 };
@@ -27,7 +28,7 @@ where
     V: Send + Sync + 'static,
 {
     collector: Box<Collector>,
-    free_list: FreeList<Linked<Node<K, V>>>,
+    free_list: Box<FreeList<Linked<Node<K, V>>>>,
     skiplist: SkipMap<RefCounted<K>, Atomic<Node<K, V>>>,
     // `head` and `tail` are sentry nodes which have no valid data
     head: Box<Linked<Node<K, V>>>,
@@ -67,15 +68,16 @@ where
 {
     pub fn new(capacity: NonZeroUsize) -> Self {
         let collector = Box::new(Collector::new());
-        let head = Node::uninit(&collector);
-        let tail = Node::uninit(&collector);
+        let free_list = Box::new(FreeList::new());
+        let head = Node::uninit(&collector, &free_list);
+        let tail = Node::uninit(&collector, &free_list);
         let head_ref = unsafe { &mut *head.as_ptr() };
         let tail_ref = unsafe { &mut *tail.as_ptr() };
         head_ref.next = CachePadded::new(tail.into());
         tail_ref.prev = CachePadded::new(head.into());
         Self {
             collector,
-            free_list: FreeList::new(),
+            free_list,
             skiplist: SkipMap::new(),
             head: unsafe { head.into_box() },
             tail: unsafe { tail.into_box() },
@@ -85,13 +87,13 @@ where
     }
 
     #[inline]
-    fn head<'a>(&self, guard: &'a LocalGuard<'a>) -> NodeRefGuard<'a, K, V> {
+    fn head<'a>(&self, guard: &'a ReuseGuard<K, V, LocalGuard>) -> NodeRefGuard<'a, K, V> {
         self.head.try_increase_ref();
         unsafe { NodeRefGuard::new(ptr::from_ref(self.head.as_ref()).into(), guard) }
     }
 
     #[inline]
-    fn tail<'a>(&self, guard: &'a LocalGuard<'a>) -> NodeRefGuard<'a, K, V> {
+    fn tail<'a>(&self, guard: &'a ReuseGuard<K, V, LocalGuard>) -> NodeRefGuard<'a, K, V> {
         self.tail.try_increase_ref();
         unsafe { NodeRefGuard::new(ptr::from_ref(self.tail.as_ref()).into(), guard) }
     }
@@ -100,7 +102,7 @@ where
     fn copy_entry_node<'a, F>(
         &'a self,
         entry_fn: F,
-        guard: &'a LocalGuard<'a>,
+        guard: &'a ReuseGuard<K, V, LocalGuard>,
     ) -> Option<(NodeRefGuard<'a, K, V>, NodeEntry<'a, K, V>)>
     where
         F: Fn() -> Option<NodeEntry<'a, K, V>>,
@@ -135,23 +137,8 @@ where
         self.size.load(Ordering::Relaxed)
     }
 
-    #[inline]
-    unsafe fn free_node(&self, node: Shared<'_, Node<K, V>>) {
-        debug_assert!(!node.is_null());
-        let guard = &unsafe { unprotected() };
-        let node_ref = unsafe { &mut *node.as_ptr() };
-        node_ref.key = None;
-        let next = node_ref.next.load(Ordering::Relaxed, guard);
-        Node::release(next, guard);
-        let prev = node_ref.prev.load(Ordering::Relaxed, guard);
-        Node::release(prev, guard);
-        let desc = node_ref.desc.load(Ordering::Relaxed, guard);
-        unsafe { guard.retire_shared(desc) };
-        unsafe { self.free_list.free(node_ref.into()) };
-    }
-
     pub fn remove(&self, key: &K) -> Option<Entry<K, V>> {
-        let guard = self.collector.enter();
+        let guard = reuse_guard(self.collector.enter());
         let Some((mut node, mut entry)) = self.copy_entry_node(|| self.skiplist.get(key), &guard)
         else {
             return None;
@@ -185,7 +172,7 @@ where
                 Descriptor::Insert(op) => {
                     let backoff = Backoff::new();
                     op.run_op(self, node_ptr, &backoff, &guard);
-                    let value = op.clone_value(&guard);
+                    let value = op.clone_value(&guard.guard);
                     let desc = Shared::boxed(
                         Descriptor::Remove(op::Remove::new(value.clone())),
                         &self.collector,
@@ -203,9 +190,9 @@ where
                     {
                         self.size.fetch_sub(1, Ordering::Relaxed);
                         unsafe { desc.deref() }.run_op(self, node_ptr, &Backoff::new(), &guard);
-                        Self::remove_entry(entry, &guard);
+                        Self::remove_entry(entry, &guard.guard);
                         unsafe {
-                            guard.retire_shared(old_desc);
+                            guard.guard.retire_shared(old_desc);
                         }
                         break Some(Entry::new(
                             node_ref.key.as_ref().unwrap().clone(),
@@ -220,7 +207,7 @@ where
     }
 
     pub fn pop_back(&self) -> Option<Entry<K, V>> {
-        let guard = self.collector.enter();
+        let guard = reuse_guard(self.collector.enter());
         loop {
             let node = Node::deref_node(&self.tail.prev, Ordering::Relaxed, &guard);
             if ptr::eq(node.as_shared().as_ptr(), self.head.as_ref()) {
@@ -239,7 +226,7 @@ where
                 }
                 Descriptor::Insert(op) => {
                     op.run_op(self, node_ptr, &Backoff::new(), &guard);
-                    let value = op.clone_value(&guard);
+                    let value = op.clone_value(&guard.guard);
                     let desc = Shared::boxed(
                         Descriptor::Remove(op::Remove::new(value.clone())),
                         &self.collector,
@@ -264,12 +251,12 @@ where
                                 entry.value().load(Ordering::Relaxed, &guard).as_ptr(),
                                 node_ref,
                             ) {
-                                Self::remove_entry(entry, &guard);
+                                Self::remove_entry(entry, &guard.guard);
                             }
                         }
 
                         unsafe {
-                            guard.retire_shared(old_desc);
+                            guard.guard.retire_shared(old_desc);
                         }
                         break Some(Entry::new(
                             node_ref.key.as_ref().unwrap().clone(),
@@ -283,7 +270,7 @@ where
     }
 
     pub fn put(&self, key: K, value: V) -> Option<Entry<K, V>> {
-        let guard = self.collector.enter();
+        let guard = reuse_guard(self.collector.enter());
         let new_node = Node::new(key, value, self, &guard);
         let new_node_ref = unsafe { new_node.as_shared().deref() };
         let desc = new_node_ref.desc.load(Ordering::Relaxed, &guard);
@@ -326,7 +313,7 @@ where
                 let Some(mut node) = Node::try_copy(cur_node, &guard) else {
                     continue;
                 };
-                let value = desc_ref.clone_value(&guard);
+                let value = desc_ref.clone_value(&guard.guard);
                 let (cur_desc, old_value) = 'desc_select: loop {
                     let node_ptr = node.as_shared();
                     let node_ref = unsafe { node_ptr.deref() };
@@ -336,7 +323,7 @@ where
                         // The node was removed, try to allocate a new node
                         Descriptor::Remove(op) => {
                             op.link_prev.run_op(self, node_ptr, &backoff, &guard);
-                            Self::remove_entry(entry, &guard);
+                            Self::remove_entry(entry, &guard.guard);
                             continue 'outer;
                         }
                         Descriptor::Detach(op) => {
@@ -348,15 +335,17 @@ where
                             }
                             continue 'desc_select;
                         }
-                        Descriptor::Insert(op) => match op.change_value(value.clone(), &guard) {
-                            Err(value) => Shared::boxed(
-                                Descriptor::Detach(op::Detach::new(value)),
-                                &self.collector,
-                            ),
-                            Ok(old_value) => {
-                                break 'desc_select (old_desc, old_value);
+                        Descriptor::Insert(op) => {
+                            match op.change_value(value.clone(), &guard.guard) {
+                                Err(value) => Shared::boxed(
+                                    Descriptor::Detach(op::Detach::new(value)),
+                                    &self.collector,
+                                ),
+                                Ok(old_value) => {
+                                    break 'desc_select (old_desc, old_value);
+                                }
                             }
-                        },
+                        }
                     };
 
                     old_desc_ref.run_op(self, node_ptr, &backoff, &guard);
@@ -372,9 +361,9 @@ where
                         )
                         .is_ok()
                     {
-                        let old_value = old_desc_ref.clone_value(&guard);
+                        let old_value = old_desc_ref.clone_value(&guard.guard);
                         unsafe {
-                            guard.retire_shared(old_desc);
+                            guard.guard.retire_shared(old_desc);
                         }
                         break (new_desc, old_value);
                     }
@@ -383,7 +372,7 @@ where
                 };
 
                 // Our node will not be used so we can remove it forcely.
-                unsafe { self.free_node(new_node.into_node()) };
+                unsafe { free_unused_node(&self.free_list, new_node.into_node()) };
 
                 let cur_desc_ref = unsafe { cur_desc.deref() };
                 cur_desc_ref.run_op(self, node.as_shared(), &backoff, &guard);
@@ -395,7 +384,7 @@ where
     }
 
     pub fn get(&self, key: &K) -> Option<Entry<K, V>> {
-        let guard = self.collector.enter();
+        let guard = reuse_guard(self.collector.enter());
         let backoff = Backoff::new();
         let Some((mut node, _)) = self.copy_entry_node(|| self.skiplist.get(key), &guard) else {
             return None;
@@ -431,11 +420,11 @@ where
                     {
                         return Some(Entry::new(
                             node_ref.key.as_ref().unwrap().clone(),
-                            op.clone_value(&guard),
+                            op.clone_value(&guard.guard),
                             &self.collector,
                         ));
                     }
-                    let value = op.clone_value(&guard);
+                    let value = op.clone_value(&guard.guard);
                     let new_desc = Shared::boxed(
                         Descriptor::Detach(op::Detach::new(value.clone())),
                         &self.collector,
@@ -452,7 +441,7 @@ where
                         .is_ok()
                     {
                         unsafe {
-                            guard.retire_shared(old_desc);
+                            guard.guard.retire_shared(old_desc);
                         }
                         unsafe { new_desc.deref() }.run_op(self, node_ptr, &backoff, &guard);
                         break Some(Entry::new(
@@ -472,7 +461,7 @@ where
         node: NodeRefGuard<'a, K, V>,
         op: &op::Attach,
         backoff: &Backoff,
-        guard: &'a LocalGuard,
+        guard: &'a ReuseGuard<K, V, LocalGuard>,
     ) {
         let node_ref = unsafe { node.as_shared().deref() };
         let head = self.head(guard);
@@ -587,7 +576,7 @@ where
         node: Shared<'a, Node<K, V>>,
         mut next: NodeRefGuard<'a, K, V>,
         backoff: &Backoff,
-        guard: &'a LocalGuard,
+        guard: &'a ReuseGuard<K, V, LocalGuard>,
     ) -> NodeRefGuard<'a, K, V> {
         let node_ref = unsafe { node.deref() };
         let mut last: Option<NodeRefGuard<'a, K, V>> = None;
@@ -654,7 +643,7 @@ where
         &self,
         node: Shared<'a, Node<K, V>>,
         backoff: &Backoff,
-        guard: &'a LocalGuard,
+        guard: &'a ReuseGuard<K, V, LocalGuard>,
     ) {
         let node_ref = unsafe { node.deref() };
         node_ref.mark_next(backoff, guard);
@@ -730,6 +719,7 @@ where
 
 #[derive(Debug)]
 pub struct Node<K: Send + Sync, V: Send + Sync> {
+    free_list: NonNull<FreeList<Linked<Node<K, V>>>>,
     key: Option<RefCounted<K>>,
     ref_count: CachePadded<AtomicUsize>,
     next: CachePadded<Atomic<Node<K, V>>>,
@@ -751,7 +741,7 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
         key: K,
         value: V,
         lru_cache: &Lru<K, V>,
-        guard: &'a LocalGuard<'a>,
+        guard: &'a ReuseGuard<K, V, LocalGuard>,
     ) -> NodeRefGuard<'a, K, V> {
         Self::from_ref_counted(
             RefCounted::new(key, &lru_cache.collector),
@@ -765,7 +755,7 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
         key: RefCounted<K>,
         value: RefCounted<V>,
         lru_cache: &Lru<K, V>,
-        guard: &'a LocalGuard<'a>,
+        guard: &'a ReuseGuard<K, V, LocalGuard>,
     ) -> NodeRefGuard<'a, K, V> {
         let desc = Shared::boxed(
             Descriptor::Insert(op::Insert::new(value)),
@@ -786,6 +776,7 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
         } else {
             Shared::boxed(
                 Self {
+                    free_list: lru_cache.free_list.as_ref().into(),
                     key: Some(key),
                     ref_count: CachePadded::new(AtomicUsize::new(2)),
                     next: CachePadded::new(Shared::from(lru_cache.tail(guard)).into()),
@@ -799,9 +790,13 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
     }
 
     #[inline]
-    fn uninit<'a>(collector: &Collector) -> Shared<'a, Self> {
+    fn uninit<'a>(
+        collector: &Collector,
+        free_list: &FreeList<Linked<Node<K, V>>>,
+    ) -> Shared<'a, Self> {
         Shared::boxed(
             Self {
+                free_list: free_list.into(),
                 key: None,
                 ref_count: CachePadded::new(AtomicUsize::new(1)),
                 next: CachePadded::new(Atomic::null()),
@@ -812,7 +807,10 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
         )
     }
 
-    fn mark_next(&self, backoff: &Backoff, guard: &LocalGuard) {
+    fn mark_next<G>(&self, backoff: &Backoff, guard: &G)
+    where
+        G: Guard,
+    {
         loop {
             let next = self.next.load(Ordering::Acquire, guard);
             if next.tag() != 0 {
@@ -890,7 +888,7 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
     fn try_deref_node<'a>(
         ptr: &Atomic<Node<K, V>>,
         order: Ordering,
-        guard: &'a LocalGuard,
+        guard: &'a ReuseGuard<K, V, LocalGuard<'a>>,
     ) -> Option<NodeRefGuard<'a, K, V>> {
         loop {
             let node = ptr.load(order, guard);
@@ -913,7 +911,7 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
     fn deref_node<'a>(
         ptr: &Atomic<Node<K, V>>,
         order: Ordering,
-        guard: &'a LocalGuard,
+        guard: &'a ReuseGuard<K, V, LocalGuard<'a>>,
     ) -> NodeRefGuard<'a, K, V> {
         loop {
             let node = ptr.load(order, guard);
@@ -933,7 +931,7 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
 
     fn try_copy<'a>(
         this: Shared<'a, Node<K, V>>,
-        guard: &'a LocalGuard,
+        guard: &'a ReuseGuard<K, V, LocalGuard>,
     ) -> Option<NodeRefGuard<'a, K, V>> {
         debug_assert!(!this.is_null());
         if unsafe { this.deref() }.try_increase_ref() {
@@ -943,7 +941,7 @@ impl<K: Send + Sync + Ord, V: Send + Sync> Node<K, V> {
         }
     }
 
-    fn remove_cross_ref(&self, guard: &LocalGuard) {
+    fn remove_cross_ref(&self, guard: &ReuseGuard<K, V, LocalGuard>) {
         loop {
             let prev = self.prev.load(Ordering::Relaxed, guard);
             let prev_ref = unsafe { prev.deref() };
@@ -986,13 +984,105 @@ impl<K: Send + Sync, V: Send + Sync> Freeable for Linked<Node<K, V>> {
     }
 }
 
+#[inline]
+unsafe fn free_node<K, V>(free_list: &FreeList<Linked<Node<K, V>>>, node: Shared<'_, Node<K, V>>)
+where
+    K: Send + Sync,
+    V: Send + Sync,
+{
+    debug_assert!(!node.is_null());
+    let node_ref = unsafe { &mut *node.as_ptr() };
+    node_ref.key = None;
+    unsafe { free_list.free(node_ref.into()) };
+}
+
+#[inline]
+unsafe fn free_unused_node<K, V>(
+    free_list: &FreeList<Linked<Node<K, V>>>,
+    node: Shared<'_, Node<K, V>>,
+) where
+    K: Send + Sync + Ord,
+    V: Send + Sync,
+{
+    debug_assert!(!node.is_null());
+    let guard = &unsafe { unprotected() };
+    let node_ref = unsafe { &mut *node.as_ptr() };
+    node_ref.key = None;
+    Node::release(node_ref.next.load(Ordering::Relaxed, guard), guard);
+    Node::release(node_ref.prev.load(Ordering::Relaxed, guard), guard);
+    unsafe { guard.retire_shared(node_ref.desc.load(Ordering::Relaxed, guard)) };
+    unsafe { free_list.free(node_ref.into()) };
+}
+
+struct ReuseGuard<K, V, G>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+{
+    guard: G,
+    _marker: PhantomData<Node<K, V>>,
+}
+
+impl<K, V, G> Guard for ReuseGuard<K, V, G>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    G: Guard,
+{
+    #[inline]
+    fn refresh(&mut self) {
+        self.guard.refresh();
+    }
+
+    #[inline]
+    fn flush(&self) {
+        self.guard.flush();
+    }
+
+    #[inline]
+    fn protect<T: seize::AsLink>(&self, ptr: &atomic::AtomicPtr<T>, ordering: Ordering) -> *mut T {
+        self.guard.protect(ptr, ordering)
+    }
+
+    #[inline]
+    unsafe fn defer_retire<T: seize::AsLink>(&self, ptr: *mut T, _: unsafe fn(*mut seize::Link)) {
+        self.guard.defer_retire(ptr, |link| {
+            let node_ptr: Shared<_> = link.cast::<Linked<Node<K, V>>>().into();
+            free_node(unsafe { node_ptr.deref().free_list.as_ref() }, node_ptr);
+        });
+    }
+
+    #[inline]
+    fn thread_id(&self) -> usize {
+        self.guard.thread_id()
+    }
+
+    #[inline]
+    fn belongs_to(&self, collector: &Collector) -> bool {
+        self.guard.belongs_to(collector)
+    }
+}
+
+#[inline]
+fn reuse_guard<K, V, G>(guard: G) -> ReuseGuard<K, V, G>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    G: Guard,
+{
+    ReuseGuard {
+        guard,
+        _marker: Default::default(),
+    }
+}
+
 struct NodeRefGuard<'a, K, V>
 where
     K: Send + Sync + Ord,
     V: Send + Sync,
 {
     node: Shared<'a, Node<K, V>>,
-    guard: &'a LocalGuard<'a>,
+    guard: &'a ReuseGuard<K, V, LocalGuard<'a>>,
 }
 
 impl<'a, K, V> Clone for NodeRefGuard<'a, K, V>
@@ -1008,13 +1098,16 @@ where
     }
 }
 
-impl<'a, K, V> Pointer<'a, Node<K, V>, LocalGuard<'a>> for NodeRefGuard<'a, K, V>
+impl<'a, K, V> Pointer<'a, Node<K, V>, ReuseGuard<K, V, LocalGuard<'a>>> for NodeRefGuard<'a, K, V>
 where
     K: Send + Sync + Ord,
     V: Send + Sync,
 {
     #[inline]
-    unsafe fn new_with_guard(ptr: Shared<'a, Node<K, V>>, guard: &'a LocalGuard<'a>) -> Self {
+    unsafe fn new_with_guard(
+        ptr: Shared<'a, Node<K, V>>,
+        guard: &'a ReuseGuard<K, V, LocalGuard<'a>>,
+    ) -> Self {
         Self::new(ptr, guard)
     }
 
@@ -1030,7 +1123,10 @@ where
     V: Send + Sync,
 {
     #[inline]
-    unsafe fn new(node: Shared<'a, Node<K, V>>, guard: &'a LocalGuard<'a>) -> Self {
+    unsafe fn new(
+        node: Shared<'a, Node<K, V>>,
+        guard: &'a ReuseGuard<K, V, LocalGuard<'a>>,
+    ) -> Self {
         Self {
             node: node.without_tag(),
             guard,
@@ -1098,7 +1194,7 @@ where
         lru_cache: &Lru<K, V>,
         node: Shared<'a, Node<K, V>>,
         backoff: &Backoff,
-        guard: &'a LocalGuard,
+        guard: &'a ReuseGuard<K, V, LocalGuard>,
     ) -> bool
     where
         K: Send + Sync + Ord,
@@ -1144,10 +1240,14 @@ mod op {
             lru_cache: &Lru<K, V>,
             node: Shared<'g, Node<K, V>>,
             backoff: &Backoff,
-            guard: &'g LocalGuard<'g>,
+            guard: &'g ReuseGuard<K, V, LocalGuard>,
         ) -> bool;
-        fn store_result(&self, result: Self::Result, guard: &'a LocalGuard) -> bool;
-        fn is_finished(&self, guard: &LocalGuard) -> bool;
+        fn store_result(
+            &self,
+            result: Self::Result,
+            guard: &'a ReuseGuard<K, V, LocalGuard>,
+        ) -> bool;
+        fn is_finished(&self, guard: &ReuseGuard<K, V, LocalGuard>) -> bool;
     }
 
     pub struct LinkPrev {
@@ -1174,7 +1274,7 @@ mod op {
             lru_cache: &Lru<K, V>,
             node: Shared<'g, Node<K, V>>,
             backoff: &Backoff,
-            guard: &'g LocalGuard<'g>,
+            guard: &'g ReuseGuard<K, V, LocalGuard>,
         ) -> bool {
             let mut prev;
             loop {
@@ -1210,11 +1310,11 @@ mod op {
             LruOperation::<K, V>::store_result(self, (), guard)
         }
 
-        fn store_result(&self, _: Self::Result, _: &'a LocalGuard) -> bool {
+        fn store_result(&self, _: Self::Result, _: &'a ReuseGuard<K, V, LocalGuard>) -> bool {
             store_bool_result(&self.result)
         }
 
-        fn is_finished(&self, _: &LocalGuard) -> bool {
+        fn is_finished(&self, _: &ReuseGuard<K, V, LocalGuard>) -> bool {
             check_bool_result(&self.result)
         }
     }
@@ -1247,7 +1347,7 @@ mod op {
             lru_cache: &Lru<K, V>,
             node: Shared<'g, Node<K, V>>,
             backoff: &Backoff,
-            guard: &'g LocalGuard<'g>,
+            guard: &'g ReuseGuard<K, V, LocalGuard>,
         ) -> bool {
             if !LruOperation::<K, V>::is_finished(self, guard) {
                 LruOperation::<K, V>::run_op(&self.link_prev, lru_cache, node, backoff, guard);
@@ -1266,11 +1366,11 @@ mod op {
             }
         }
 
-        fn store_result(&self, _: Self::Result, _: &'a LocalGuard) -> bool {
+        fn store_result(&self, _: Self::Result, _: &'a ReuseGuard<K, V, LocalGuard>) -> bool {
             store_bool_result(&self.result)
         }
 
-        fn is_finished(&self, _: &LocalGuard) -> bool {
+        fn is_finished(&self, _: &ReuseGuard<K, V, LocalGuard>) -> bool {
             check_bool_result(&self.result)
         }
     }
@@ -1297,7 +1397,10 @@ mod op {
             }
         }
 
-        pub fn get_new_node<'a>(&self, guard: &'a LocalGuard) -> Option<NodeRefGuard<'a, K, V>> {
+        pub fn get_new_node<'a>(
+            &self,
+            guard: &'a ReuseGuard<K, V, LocalGuard>,
+        ) -> Option<NodeRefGuard<'a, K, V>> {
             Node::try_deref_node(&self.new_node, Ordering::Acquire, guard)
         }
 
@@ -1305,7 +1408,7 @@ mod op {
             &self,
             lru_cache: &Lru<K, V>,
             node: Shared<'a, Node<K, V>>,
-            guard: &'a LocalGuard,
+            guard: &'a ReuseGuard<K, V, LocalGuard>,
         ) -> Option<NodeRefGuard<'a, K, V>> {
             // ORDERING: `Relaxed` is fine because reading non-null `new_node` doesn't mean
             // any visible side effect useful.
@@ -1319,7 +1422,7 @@ mod op {
             if LruOperation::<K, V>::store_result(self, new_node.clone().into_node(), guard) {
                 Some(new_node)
             } else {
-                unsafe { lru_cache.free_node(new_node.into_node()) };
+                unsafe { free_unused_node(&lru_cache.free_list, new_node.into_node()) };
                 Node::try_deref_node(&self.new_node, Ordering::Acquire, guard)
             }
         }
@@ -1338,7 +1441,7 @@ mod op {
             lru_cache: &Lru<K, V>,
             node: Shared<'g, Node<K, V>>,
             backoff: &Backoff,
-            guard: &'g LocalGuard<'g>,
+            guard: &'g ReuseGuard<K, V, LocalGuard>,
         ) -> bool {
             if LruOperation::<K, V>::is_finished(self, guard) {
                 return false;
@@ -1398,7 +1501,11 @@ mod op {
             return LruOperation::<K, V>::run_op(&self.remove, lru_cache, node, backoff, guard);
         }
 
-        fn store_result(&self, result: Self::Result, guard: &'a LocalGuard) -> bool {
+        fn store_result(
+            &self,
+            result: Self::Result,
+            guard: &'a ReuseGuard<K, V, LocalGuard>,
+        ) -> bool {
             self.new_node
                 .compare_exchange(
                     Shared::null(),
@@ -1410,7 +1517,7 @@ mod op {
                 .is_ok()
         }
 
-        fn is_finished(&self, guard: &LocalGuard) -> bool {
+        fn is_finished(&self, guard: &ReuseGuard<K, V, LocalGuard>) -> bool {
             LruOperation::<K, V>::is_finished(&self.remove, guard)
         }
     }
@@ -1430,7 +1537,7 @@ mod op {
             lru_cache: &Lru<K, V>,
             node: Shared<'g, Node<K, V>>,
             backoff: &Backoff,
-            guard: &'g LocalGuard<'g>,
+            guard: &'g ReuseGuard<K, V, LocalGuard>,
         ) -> bool {
             if LruOperation::<K, V>::is_finished(self, guard) {
                 return false;
@@ -1445,11 +1552,11 @@ mod op {
             <op::Attach as LruOperation<K, V>>::store_result(self, (), guard)
         }
 
-        fn store_result(&self, _: Self::Result, _: &'a LocalGuard) -> bool {
+        fn store_result(&self, _: Self::Result, _: &'a ReuseGuard<K, V, LocalGuard>) -> bool {
             store_bool_result(&self.result)
         }
 
-        fn is_finished(&self, _: &LocalGuard) -> bool {
+        fn is_finished(&self, _: &ReuseGuard<K, V, LocalGuard>) -> bool {
             check_bool_result(&self.result)
         }
     }
@@ -1523,13 +1630,13 @@ mod op {
             lru_cache: &Lru<K, V>,
             node: Shared<'g, Node<K, V>>,
             backoff: &Backoff,
-            guard: &'g LocalGuard<'g>,
+            guard: &'g ReuseGuard<K, V, LocalGuard>,
         ) -> bool {
             LruOperation::run_op(&self.attach, lru_cache, node, backoff, guard);
             loop {
                 let Ok(new_value) = self
                     .value
-                    .try_clone_inner(Ordering::Acquire, guard)
+                    .try_clone_inner(Ordering::Acquire, &guard.guard)
                     .map(|v| v.unwrap())
                 else {
                     // Someone changed value. Retry.
@@ -1545,13 +1652,13 @@ mod op {
             }
         }
 
-        fn store_result(&self, _: Self::Result, guard: &'a LocalGuard) -> bool {
+        fn store_result(&self, _: Self::Result, guard: &'a ReuseGuard<K, V, LocalGuard>) -> bool {
             self.value
-                .make_constant(Ordering::Release, Ordering::Relaxed, guard)
+                .make_constant(Ordering::Release, Ordering::Relaxed, &guard.guard)
         }
 
-        fn is_finished(&self, guard: &LocalGuard) -> bool {
-            self.value.is_constant(guard)
+        fn is_finished(&self, guard: &ReuseGuard<K, V, LocalGuard>) -> bool {
+            self.value.is_constant(&guard.guard)
         }
     }
 }
