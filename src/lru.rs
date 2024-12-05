@@ -26,14 +26,16 @@ where
     K: Ord + Send + Sync + 'static,
     V: Send + Sync + 'static,
 {
-    collector: Box<Collector>,
-    free_list: FreeList<Linked<Node<K, V>>>,
     skiplist: SkipMap<RefCounted<K>, Atomic<Node<K, V>>>,
+    free_list: FreeList<Linked<Node<K, V>>>,
     // `head` and `tail` are sentry nodes which have no valid data
     head: Box<Linked<Node<K, V>>>,
     tail: Box<Linked<Node<K, V>>>,
     cap: NonZeroUsize,
     size: AtomicUsize,
+    // Collector must be the last member otherwise nodes in skiplist or free list will be freed
+    // twice.
+    collector: Box<Collector>,
 }
 
 unsafe impl<K: Ord + Send + Sync, V: Send + Sync> Send for Lru<K, V> {}
@@ -45,16 +47,11 @@ where
     V: Send + Sync + 'static,
 {
     fn drop(&mut self) {
-        self.skiplist.clear();
-        // TODO: Reclaim free list
-        // TODO: Delete this line because it is only for testing
-        unsafe {
-            Box::leak(mem::replace(
-                &mut self.collector,
-                Box::new(Collector::new()),
-            ))
-            .reclaim_all()
-        };
+        let guard = unsafe { unprotected() };
+        for entry in self.skiplist.iter() {
+            let node = entry.value().load(Ordering::Relaxed, &guard);
+            unsafe { guard.retire_shared(node) };
+        }
     }
 }
 
@@ -157,6 +154,11 @@ where
         Node::release(prev, guard);
         let desc = node_ref.desc.load(Ordering::Relaxed, guard);
         unsafe { guard.retire_shared(desc) };
+        // We should store null value to desc here otherwise the old desc will be reclaimed once
+        // when free list is reclaimed due to `Drop` impl for `Node`.
+        node_ref
+            .desc
+            .store::<_, UnprotectedGuard>(Shared::null(), Ordering::Relaxed);
         unsafe { self.free_list.free(node_ref.into()) };
     }
 

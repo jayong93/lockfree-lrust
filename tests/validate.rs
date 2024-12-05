@@ -2,7 +2,7 @@ use std::{num::NonZeroUsize, ptr};
 
 use lockfree_car::lru::Lru;
 
-const TEST_COUNT: usize = 1_000_000;
+const TEST_COUNT: usize = 10_000_000;
 
 #[test]
 fn test_no_eviction() {
@@ -77,7 +77,9 @@ fn test_lru_property() {
     });
     assert_eq!(cache.len(), 10);
     let mut it = cache.iter();
-    assert!(matches!(it.next(), Some(entry) if *entry.value() == 9 && *entry.key() == 10));
+    let lru = it.next().unwrap();
+    assert_eq!(*lru.value(), 5);
+    assert_eq!(*lru.key(), 6);
     for _ in 0..4 {
         it.next();
     }
@@ -86,7 +88,7 @@ fn test_lru_property() {
         for _ in 0..8 {
             s.spawn(|| {
                 for i in 0..TEST_COUNT {
-                    cache.put(i % 5 + 5, i);
+                    cache.put(i % 5 + 6, i);
                 }
             });
         }
@@ -94,5 +96,8 @@ fn test_lru_property() {
     let mut new_it = cache.iter();
     let new_lru = new_it.next().unwrap();
     assert_eq!(ptr::from_ref(next_lru.key()), ptr::from_ref(new_lru.key()));
-    assert_eq!(ptr::from_ref(next_lru.value()), ptr::from_ref(new_lru.value()));
+    assert_eq!(
+        ptr::from_ref(next_lru.value()),
+        ptr::from_ref(new_lru.value())
+    );
 }
