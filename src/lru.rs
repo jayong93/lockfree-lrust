@@ -224,6 +224,8 @@ where
                             value,
                             &self.collector,
                         ));
+                    } else {
+                        drop(unsafe { desc.into_box() });
                     }
                     backoff.spin();
                 }
@@ -288,6 +290,8 @@ where
                             value,
                             &self.collector,
                         ));
+                    } else {
+                        drop(unsafe { desc.into_box() });
                     }
                 }
             }
@@ -472,6 +476,8 @@ where
                             value,
                             &self.collector,
                         ));
+                    } else {
+                        drop(unsafe { new_desc.into_box() });
                     }
                 }
             }
@@ -1371,7 +1377,9 @@ mod op {
             let key = unsafe { node.deref() }.key.as_ref().unwrap().clone();
             let value = self.remove.value.clone();
             let new_node = Node::from_ref_counted(key, value, lru_cache, guard);
-            if LruOperation::<K, V>::store_result(self, new_node.clone().into_node(), guard) {
+            // Reference count for `new_node` is initially 2 so we don't need to increase the count
+            // here, instead we just store as a result.
+            if LruOperation::<K, V>::store_result(self, new_node.as_shared(), guard) {
                 Some(new_node)
             } else {
                 unsafe { lru_cache.free_node(new_node.into_node()) };
@@ -1487,12 +1495,13 @@ mod op {
             backoff: &Backoff,
             guard: &'g LocalGuard<'g>,
         ) -> bool {
+            let node = Node::try_copy(node, guard);
             if LruOperation::<K, V>::is_finished(self, guard) {
                 return false;
             }
 
             lru_cache.put_node_after_head(
-                Node::try_copy(node, guard).unwrap(),
+                node.unwrap(),
                 self,
                 &backoff,
                 guard,
